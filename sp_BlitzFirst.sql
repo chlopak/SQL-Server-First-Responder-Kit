@@ -22,6 +22,7 @@ ALTER PROCEDURE [dbo].[sp_BlitzFirst]
     @OutputXMLasNVARCHAR TINYINT = 0 ,
     @FilterPlansByDatabase VARCHAR(MAX) = NULL ,
     @CheckProcedureCache TINYINT = 0 ,
+    @CheckServerInfo TINYINT = 1 ,
     @FileLatencyThresholdMS INT = 100 ,
     @SinceStartup TINYINT = 0 ,
     @ShowSleepingSPIDs TINYINT = 0 ,
@@ -32,16 +33,21 @@ ALTER PROCEDURE [dbo].[sp_BlitzFirst]
     @LogMessageURL VARCHAR(200) = '',
     @LogMessageCheckDate DATETIMEOFFSET = NULL,
     @Debug BIT = 0,
-    @VersionDate DATETIME = NULL OUTPUT
+	@Version     VARCHAR(30) = NULL OUTPUT,
+	@VersionDate DATETIME = NULL OUTPUT,
+    @VersionCheckMode BIT = 0
     WITH EXECUTE AS CALLER, RECOMPILE
 AS
 BEGIN
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
-DECLARE @Version VARCHAR(30);
-SET @Version = '6.3';
-SET @VersionDate = '20180301';
 
+SELECT @Version = '7.7', @VersionDate = '20190826';
+
+IF(@VersionCheckMode = 1)
+BEGIN
+	RETURN;
+END;
 
 IF @Help = 1 PRINT '
 sp_BlitzFirst from http://FirstResponderKit.org
@@ -74,7 +80,7 @@ https://github.com/BrentOzarULTD/SQL-Server-First-Responder-Kit/
 
 MIT License
 
-Copyright (c) 2017 Brent Ozar Unlimited
+Copyright (c) 2019 Brent Ozar Unlimited
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -103,22 +109,25 @@ DECLARE @StringToExecute NVARCHAR(MAX),
     @Parm1 NVARCHAR(4000),
     @OurSessionID INT,
     @LineFeed NVARCHAR(10),
-    @StockWarningHeader NVARCHAR(500),
-    @StockWarningFooter NVARCHAR(100),
-    @StockDetailsHeader NVARCHAR(100),
-    @StockDetailsFooter NVARCHAR(100),
+    @StockWarningHeader NVARCHAR(MAX) = N'',
+    @StockWarningFooter NVARCHAR(MAX) = N'',
+    @StockDetailsHeader NVARCHAR(MAX) = N'',
+    @StockDetailsFooter NVARCHAR(MAX) = N'',
     @StartSampleTime DATETIMEOFFSET,
     @FinishSampleTime DATETIMEOFFSET,
 	@FinishSampleTimeWaitFor DATETIME,
+	@AsOf1 DATETIMEOFFSET,
+	@AsOf2 DATETIMEOFFSET,
     @ServiceName sysname,
     @OutputTableNameFileStats_View NVARCHAR(256),
     @OutputTableNamePerfmonStats_View NVARCHAR(256),
+    @OutputTableNamePerfmonStatsActuals_View NVARCHAR(256),
     @OutputTableNameWaitStats_View NVARCHAR(256),
     @OutputTableNameWaitStats_Categories NVARCHAR(256),
+	@OutputTableCleanupDate DATE,
     @ObjectFullName NVARCHAR(2000),
 	@BlitzWho NVARCHAR(MAX) = N'EXEC dbo.sp_BlitzWho @ShowSleepingSPIDs = ' + CONVERT(NVARCHAR(1), @ShowSleepingSPIDs) + N';',
     @BlitzCacheMinutesBack INT,
-    @BlitzCacheSortOrder VARCHAR(50),
     @UnquotedOutputServerName NVARCHAR(256) = @OutputServerName ,
     @UnquotedOutputDatabaseName NVARCHAR(256) = @OutputDatabaseName ,
     @UnquotedOutputSchemaName NVARCHAR(256) = @OutputSchemaName ;
@@ -127,6 +136,7 @@ DECLARE @StringToExecute NVARCHAR(MAX),
 SELECT
     @OutputTableNameFileStats_View = QUOTENAME(@OutputTableNameFileStats + '_Deltas'),
     @OutputTableNamePerfmonStats_View = QUOTENAME(@OutputTableNamePerfmonStats + '_Deltas'),
+    @OutputTableNamePerfmonStatsActuals_View = QUOTENAME(@OutputTableNamePerfmonStats + '_Actuals'),
     @OutputTableNameWaitStats_View = QUOTENAME(@OutputTableNameWaitStats + '_Deltas'),
     @OutputTableNameWaitStats_Categories = QUOTENAME(@OutputTableNameWaitStats + '_Categories');
 
@@ -137,12 +147,20 @@ SELECT
     @OutputTableNameFileStats = QUOTENAME(@OutputTableNameFileStats),
     @OutputTableNamePerfmonStats = QUOTENAME(@OutputTableNamePerfmonStats),
     @OutputTableNameWaitStats = QUOTENAME(@OutputTableNameWaitStats),
+	@OutputTableCleanupDate = CAST( (DATEADD(DAY, -1 * @OutputTableRetentionDays, GETDATE() ) ) AS DATE),
     /* @OutputTableNameBlitzCache = QUOTENAME(@OutputTableNameBlitzCache),  We purposely don't sanitize this because sp_BlitzCache will */
     @LineFeed = CHAR(13) + CHAR(10),
     @StartSampleTime = SYSDATETIMEOFFSET(),
     @FinishSampleTime = DATEADD(ss, @Seconds, SYSDATETIMEOFFSET()),
 	@FinishSampleTimeWaitFor = DATEADD(ss, @Seconds, GETDATE()),
-    @OurSessionID = @@SPID;
+    @OurSessionID = @@SPID,
+    @OutputType                     = UPPER(@OutputType);
+
+IF(@OutputType = 'NONE' AND @ExpertMode = 0 AND (@OutputTableName IS NULL OR @OutputSchemaName IS NULL OR @OutputDatabaseName IS NULL))
+BEGIN
+    RAISERROR('This procedure should be called with a value for all @Output* parameters, as @OutputType is set to NONE',12,1);
+    RETURN;
+END;
 
 IF @LogMessage IS NOT NULL
     BEGIN
@@ -182,13 +200,12 @@ IF @LogMessage IS NOT NULL
         + @OutputDatabaseName + '.'
         + @OutputSchemaName + '.'
         + @OutputTableName
-        + ' (ServerName, CheckDate, CheckID, Priority, FindingsGroup, Finding, Details, URL) VALUES( '''
-        + CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128))
-        + ''', ''' + CONVERT(NVARCHAR(100), @LogMessageCheckDate, 121) + ''', @LogMessageCheckID, @LogMessagePriority, @LogMessageFindingsGroup, @LogMessageFinding, @LogMessage, @LogMessageURL)';
+        + ' (ServerName, CheckDate, CheckID, Priority, FindingsGroup, Finding, Details, URL) VALUES( '
+        + ' @SrvName, @CheckDate, @LogMessageCheckID, @LogMessagePriority, @LogMessageFindingsGroup, @LogMessageFinding, @LogMessage, @LogMessageURL)';
 
-    EXECUTE sp_executesql @StringToExecute, 
-        N'@LogMessageCheckID INT, @LogMessagePriority TINYINT, @LogMessageFindingsGroup VARCHAR(50), @LogMessageFinding VARCHAR(200), @LogMessage NVARCHAR(4000), @LogMessageCheckDate DATETIMEOFFSET, @LogMessageURL VARCHAR(200)',
-        @LogMessageCheckID, @LogMessagePriority, @LogMessageFindingsGroup, @LogMessageFinding, @LogMessage, @LogMessageCheckDate, @LogMessageURL;
+    EXECUTE sp_executesql @StringToExecute,
+        N'@SrvName NVARCHAR(128), @CheckDate datetimeoffset, @LogMessageCheckID INT, @LogMessagePriority TINYINT, @LogMessageFindingsGroup VARCHAR(50), @LogMessageFinding VARCHAR(200), @LogMessage NVARCHAR(4000), @LogMessageCheckDate DATETIMEOFFSET, @LogMessageURL VARCHAR(200)',
+        @@SERVERNAME, @StartSampleTime, @LogMessageCheckID, @LogMessagePriority, @LogMessageFindingsGroup, @LogMessageFinding, @LogMessage, @LogMessageCheckDate, @LogMessageURL;
 
     RAISERROR('LogMessage saved to table. We have made a note of your activity. Keep up the good work.',10,1) WITH NOWAIT;
 
@@ -198,12 +215,18 @@ IF @LogMessage IS NOT NULL
 IF @SinceStartup = 1
     SELECT @Seconds = 0, @ExpertMode = 1;
 
-IF @Seconds = 0 AND CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) = 'SQL Azure'
-    SELECT @StartSampleTime = DATEADD(ms, AVG(-wait_time_ms), SYSDATETIMEOFFSET()), @FinishSampleTime = SYSDATETIMEOFFSET()
-        FROM sys.dm_os_wait_stats w
-        WHERE wait_type IN ('BROKER_TASK_STOP','DIRTY_PAGE_POLL','HADR_FILESTREAM_IOMGR_IOCOMPLETION','LAZYWRITER_SLEEP',
-                            'LOGMGR_QUEUE','REQUEST_FOR_DEADLOCK_SEARCH','XE_DISPATCHER_WAIT','XE_TIMER_EVENT');
-ELSE IF @Seconds = 0 AND CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) <> 'SQL Azure'
+IF @Seconds = 0 AND SERVERPROPERTY('Edition') = 'SQL Azure'
+	WITH WaitTimes AS (
+        SELECT wait_type, wait_time_ms,
+            NTILE(3) OVER(ORDER BY wait_time_ms) AS grouper
+            FROM sys.dm_os_wait_stats w
+            WHERE wait_type IN ('DIRTY_PAGE_POLL','HADR_FILESTREAM_IOMGR_IOCOMPLETION','LAZYWRITER_SLEEP',
+                                'LOGMGR_QUEUE','REQUEST_FOR_DEADLOCK_SEARCH','XE_TIMER_EVENT')
+    )
+    SELECT @StartSampleTime = DATEADD(mi, AVG(-wait_time_ms / 1000 / 60), SYSDATETIMEOFFSET()), @FinishSampleTime = SYSDATETIMEOFFSET()
+        FROM WaitTimes
+        WHERE grouper = 2;
+ELSE IF @Seconds = 0 AND SERVERPROPERTY('Edition') <> 'SQL Azure'
     SELECT @StartSampleTime = DATEADD(MINUTE,DATEDIFF(MINUTE, GETDATE(), GETUTCDATE()),create_date) , @FinishSampleTime = SYSDATETIMEOFFSET()
         FROM sys.databases
         WHERE database_id = 2;
@@ -218,6 +241,8 @@ END;
 ELSE IF @AsOf IS NOT NULL AND @OutputDatabaseName IS NOT NULL AND @OutputSchemaName IS NOT NULL AND @OutputTableName IS NOT NULL
 BEGIN
     /* They want to look into the past. */
+        SET @AsOf1= DATEADD(mi, -15, @AsOf);
+		SET @AsOf2= DATEADD(mi, +15, @AsOf);
 
         SET @StringToExecute = N' IF EXISTS(SELECT * FROM '
             + @OutputDatabaseName
@@ -228,10 +253,12 @@ BEGIN
             + @OutputDatabaseName + '.'
             + @OutputSchemaName + '.'
             + @OutputTableName
-            + ' WHERE CheckDate >= DATEADD(mi, -15, CONVERT(DATETIMEOFFSET, ''' + CAST(@AsOf AS NVARCHAR(100)) + '''))'
-            + ' AND CheckDate <= DATEADD(mi, 15, CONVERT(DATETIMEOFFSET, ''' + CAST(@AsOf AS NVARCHAR(100)) + '''))'
+            + ' WHERE CheckDate >= @AsOf1'
+            + ' AND CheckDate <= @AsOf2'
             + ' /*ORDER BY CheckDate, Priority , FindingsGroup , Finding , Details*/;';
-		EXEC(@StringToExecute);
+		EXEC sp_executesql @StringToExecute,
+			N'@AsOf1 DATETIMEOFFSET, @AsOf2 DATETIMEOFFSET',
+			@AsOf1, @AsOf2
 
 
 END; /* IF @AsOf IS NOT NULL AND @OutputDatabaseName IS NOT NULL AND @OutputSchemaName IS NOT NULL AND @OutputTableName IS NOT NULL */
@@ -267,6 +294,7 @@ BEGIN
     a tool that relies on the output of sp_BlitzFirst.
     */
 
+
     IF OBJECT_ID('tempdb..#BlitzFirstResults') IS NOT NULL
         DROP TABLE #BlitzFirstResults;
     CREATE TABLE #BlitzFirstResults
@@ -277,7 +305,7 @@ BEGIN
           FindingsGroup VARCHAR(50) NOT NULL,
           Finding VARCHAR(200) NOT NULL,
           URL VARCHAR(200) NULL,
-          Details NVARCHAR(4000) NULL,
+          Details NVARCHAR(MAX) NULL,
           HowToStopIt NVARCHAR(MAX) NULL,
           QueryPlan [XML] NULL,
           QueryText NVARCHAR(MAX) NULL,
@@ -386,6 +414,17 @@ BEGIN
 			);
 		END; /* IF OBJECT_ID('tempdb..##WaitCategories') IS NULL */
 
+	IF OBJECT_ID ('tempdb..#checkversion') IS NOT NULL
+		DROP TABLE #checkversion;
+	CREATE TABLE #checkversion (
+		version NVARCHAR(128),
+		common_version AS SUBSTRING(version, 1, CHARINDEX('.', version) + 1 ),
+		major AS PARSENAME(CONVERT(VARCHAR(32), version), 4),
+		minor AS PARSENAME(CONVERT(VARCHAR(32), version), 3),
+		build AS PARSENAME(CONVERT(VARCHAR(32), version), 2),
+		revision AS PARSENAME(CONVERT(VARCHAR(32), version), 1)
+	);
+
 	IF 504 <> (SELECT COALESCE(SUM(1),0) FROM ##WaitCategories)
 		BEGIN
 		    TRUNCATE TABLE ##WaitCategories;
@@ -414,15 +453,15 @@ BEGIN
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('BROKER_TRANSMITTER','Service Broker',1);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('CHECKPOINT_QUEUE','Idle',1);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('CHKPT','Tran Log IO',0);
-			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('CLR_AUTO_EVENT','SQL CLR',0);
+			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('CLR_AUTO_EVENT','SQL CLR',1);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('CLR_CRST','SQL CLR',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('CLR_JOIN','SQL CLR',0);
-			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('CLR_MANUAL_EVENT','SQL CLR',0);
+			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('CLR_MANUAL_EVENT','SQL CLR',1);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('CLR_MEMORY_SPY','SQL CLR',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('CLR_MONITOR','SQL CLR',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('CLR_RWLOCK_READER','SQL CLR',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('CLR_RWLOCK_WRITER','SQL CLR',0);
-			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('CLR_SEMAPHORE','SQL CLR',0);
+			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('CLR_SEMAPHORE','SQL CLR',1);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('CLR_TASK_START','SQL CLR',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('CLRHOST_STATE_ACCESS','SQL CLR',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('CMEMPARTITIONED','Memory',0);
@@ -436,7 +475,9 @@ BEGIN
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('DBMIRROR_WORKER_QUEUE','Mirroring',1);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('DBMIRRORING_CMD','Mirroring',1);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('DIRTY_PAGE_POLL','Other',1);
+			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('DIRTY_PAGE_TABLE_LOCK','Replication',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('DISPATCHER_QUEUE_SEMAPHORE','Other',1);
+			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('DPT_ENTRY_LOCK','Replication',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('DTC','Transaction',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('DTC_ABORT_REQUEST','Transaction',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('DTC_RESOLVE','Transaction',0);
@@ -488,7 +529,7 @@ BEGIN
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('HADR_DBSEEDING','Replication',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('HADR_DBSEEDING_LIST','Replication',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('HADR_DBSTATECHANGE_SYNC','Replication',0);
-			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('HADR_FABRIC_CALLBACK','Replication',0);
+			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('HADR_FABRIC_CALLBACK','Replication',1);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('HADR_FILESTREAM_BLOCK_FLUSH','Replication',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('HADR_FILESTREAM_FILE_CLOSE','Replication',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('HADR_FILESTREAM_FILE_REQUEST','Replication',0);
@@ -601,6 +642,7 @@ BEGIN
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('LCK_M_X','Lock',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('LCK_M_X_ABORT_BLOCKERS','Lock',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('LCK_M_X_LOW_PRIORITY','Lock',0);
+			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('LOG_RATE_GOVERNOR','Tran Log IO',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('LOGBUFFER','Tran Log IO',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('LOGMGR','Tran Log IO',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('LOGMGR_FLUSH','Tran Log IO',0);
@@ -626,6 +668,13 @@ BEGIN
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PAGELATCH_NL','Buffer Latch',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PAGELATCH_SH','Buffer Latch',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PAGELATCH_UP','Buffer Latch',0);
+			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PARALLEL_REDO_DRAIN_WORKER','Replication',1);
+			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PARALLEL_REDO_FLOW_CONTROL','Replication',0);
+			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PARALLEL_REDO_LOG_CACHE','Replication',1);
+			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PARALLEL_REDO_TRAN_LIST','Replication',1);
+			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PARALLEL_REDO_TRAN_TURN','Replication',1);
+			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PARALLEL_REDO_WORKER_SYNC','Replication',1);
+			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PARALLEL_REDO_WORKER_WAIT_WORK','Replication',1);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('POOL_LOG_RATE_GOVERNOR','Log Rate Governor',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PREEMPTIVE_ABR','Preemptive',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PREEMPTIVE_CLOSEBACKUPMEDIA','Preemptive',0);
@@ -817,7 +866,7 @@ BEGIN
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PREEMPTIVE_XE_CALLBACKEXECUTE','Preemptive',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PREEMPTIVE_XE_CX_FILE_OPEN','Preemptive',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PREEMPTIVE_XE_CX_HTTP_CALL','Preemptive',0);
-			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PREEMPTIVE_XE_DISPATCHER','Preemptive',0);
+			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PREEMPTIVE_XE_DISPATCHER','Preemptive',1);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PREEMPTIVE_XE_ENGINEINIT','Preemptive',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PREEMPTIVE_XE_GETTARGETSTATE','Preemptive',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('PREEMPTIVE_XE_SESSIONCOMMIT','Preemptive',0);
@@ -869,6 +918,7 @@ BEGIN
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('SLEEP_TEMPDBSTARTUP','Idle',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('SLEEP_WORKSPACE_ALLOCATEPAGE','Idle',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('SOS_SCHEDULER_YIELD','CPU',0);
+			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('SOS_WORK_DISPATCHER','Idle',1);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('SP_SERVER_DIAGNOSTICS_SLEEP','Other',1);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('SQLCLR_APPDOMAIN','SQL CLR',0);
 			INSERT INTO ##WaitCategories(WaitType, WaitCategory, Ignorable) VALUES ('SQLCLR_ASSEMBLY','SQL CLR',0);
@@ -913,7 +963,8 @@ BEGIN
         DROP TABLE #MasterFiles;
     CREATE TABLE #MasterFiles (database_id INT, file_id INT, type_desc NVARCHAR(50), name NVARCHAR(255), physical_name NVARCHAR(255), size BIGINT);
     /* Azure SQL Database doesn't have sys.master_files, so we have to build our own. */
-    IF CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) = 'SQL Azure'
+    IF ((SERVERPROPERTY('Edition')) = 'SQL Azure' 
+         AND (OBJECT_ID('sys.master_files') IS NULL))
         SET @StringToExecute = 'INSERT INTO #MasterFiles (database_id, file_id, type_desc, name, physical_name, size) SELECT DB_ID(), file_id, type_desc, name, physical_name, size FROM sys.database_files;';
     ELSE
         SET @StringToExecute = 'INSERT INTO #MasterFiles (database_id, file_id, type_desc, name, physical_name, size) SELECT database_id, file_id, type_desc, name, physical_name, size FROM sys.master_files;';
@@ -947,6 +998,21 @@ BEGIN
             END;
         END;
 
+	IF OBJECT_ID('tempdb..#ReadableDBs') IS NOT NULL 
+		DROP TABLE #ReadableDBs;
+	CREATE TABLE #ReadableDBs (
+	database_id INT
+	);
+
+	IF EXISTS (SELECT * FROM sys.all_objects o WHERE o.name = 'dm_hadr_database_replica_states')
+    BEGIN
+		RAISERROR('Checking for Read intent databases to exclude',0,0) WITH NOWAIT;
+
+        SET @StringToExecute = 'INSERT INTO #ReadableDBs (database_id) SELECT DBs.database_id FROM sys.databases DBs INNER JOIN sys.availability_replicas Replicas ON DBs.replica_id = Replicas.replica_id WHERE replica_server_name NOT IN (SELECT DISTINCT primary_replica FROM sys.dm_hadr_availability_group_states States) AND Replicas.secondary_role_allow_connections_desc = ''READ_ONLY'' AND replica_server_name = @@SERVERNAME;';
+        EXEC(@StringToExecute);
+		
+	END
+
 
     SET @StockWarningHeader = '<?ClickToSeeCommmand -- ' + @LineFeed + @LineFeed
         + 'WARNING: Running this command may result in data loss or an outage.' + @LineFeed
@@ -954,9 +1020,9 @@ BEGIN
         + 'It is not a substitute for database training and experience.' + @LineFeed
         + 'Now, having said that, here''s the details:' + @LineFeed + @LineFeed;
 
-    SELECT @StockWarningFooter = @LineFeed + @LineFeed + '-- ?>',
-        @StockDetailsHeader = '<?ClickToSeeDetails -- ' + @LineFeed,
-        @StockDetailsFooter = @LineFeed + ' -- ?>';
+    SELECT @StockWarningFooter = @StockWarningFooter + @LineFeed + @LineFeed + '-- ?>',
+           @StockDetailsHeader = @StockDetailsHeader + '<?ClickToSeeDetails -- ' + @LineFeed,
+           @StockDetailsFooter = @StockDetailsFooter + @LineFeed + ' -- ?>';
 
     /* Get the instance name to use as a Perfmon counter prefix. */
     IF CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) = 'SQL Azure'
@@ -1180,50 +1246,12 @@ BEGIN
 		       CASE @Seconds WHEN 0 THEN 0 ELSE SUM(os.waiting_tasks_count) OVER (PARTITION BY os.wait_type) END AS sum_waiting_tasks
 		   FROM sys.dm_os_wait_stats os
 		) x
-		   WHERE x.wait_type NOT IN (
-                  'BROKER_EVENTHANDLER'
-                , 'BROKER_RECEIVE_WAITFOR'
-                , 'BROKER_TASK_STOP'
-                , 'BROKER_TO_FLUSH'
-                , 'BROKER_TRANSMITTER'
-                , 'CHECKPOINT_QUEUE'
-                , 'DBMIRROR_DBM_EVENT'
-                , 'DBMIRROR_DBM_MUTEX'
-                , 'DBMIRROR_EVENTS_QUEUE'
-                , 'DBMIRROR_WORKER_QUEUE'
-                , 'DBMIRRORING_CMD'
-                , 'DIRTY_PAGE_POLL'
-                , 'DISPATCHER_QUEUE_SEMAPHORE'
-                , 'FT_IFTS_SCHEDULER_IDLE_WAIT'
-                , 'FT_IFTSHC_MUTEX'
-                , 'HADR_CLUSAPI_CALL'
-                , 'HADR_FILESTREAM_IOMGR_IOCOMPLETION'
-                , 'HADR_LOGCAPTURE_WAIT'
-                , 'HADR_NOTIFICATION_DEQUEUE'
-                , 'HADR_TIMER_TASK'
-                , 'HADR_WORK_QUEUE'
-                , 'LAZYWRITER_SLEEP'
-                , 'LOGMGR_QUEUE'
-                , 'ONDEMAND_TASK_QUEUE'
-                , 'PREEMPTIVE_HADR_LEASE_MECHANISM'
-                , 'PREEMPTIVE_SP_SERVER_DIAGNOSTICS'
-                , 'QDS_ASYNC_QUEUE'
-                , 'QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP'
-                , 'QDS_PERSIST_TASK_MAIN_LOOP_SLEEP'
-                , 'QDS_SHUTDOWN_QUEUE'
-                , 'REDO_THREAD_PENDING_WORK'
-                , 'REQUEST_FOR_DEADLOCK_SEARCH'
-                , 'SLEEP_SYSTEMTASK'
-                , 'SLEEP_TASK'
-                , 'SP_SERVER_DIAGNOSTICS_SLEEP'
-                , 'SQLTRACE_BUFFER_FLUSH'
-                , 'SQLTRACE_INCREMENTAL_FLUSH_SLEEP'
-                , 'UCS_SESSION_REGISTRATION'
-                , 'WAIT_XTP_OFFLINE_CKPT_NEW_LOG'
-                , 'WAITFOR'
-                , 'XE_DISPATCHER_WAIT'
-                , 'XE_LIVE_TARGET_TVF'
-                , 'XE_TIMER_EVENT'
+		   WHERE EXISTS 
+		   (
+                SELECT 1/0
+				FROM ##WaitCategories AS wc
+				WHERE wc.WaitType = x.wait_type
+				AND wc.Ignorable = 0
 		   )
 		GROUP BY x.Pass, x.SampleTime, x.wait_type
 		ORDER BY sum_wait_time_ms DESC;
@@ -1272,8 +1300,9 @@ BEGIN
         'Maintenance Tasks Running' AS FindingGroup,
         'Backup Running' AS Finding,
         'http://www.BrentOzar.com/askbrent/backups/' AS URL,
-        'Backup of ' + DB_NAME(db.resource_database_id) + ' database (' + (SELECT CAST(CAST(SUM(size * 8.0 / 1024 / 1024) AS BIGINT) AS NVARCHAR) FROM #MasterFiles WHERE database_id = db.resource_database_id) + 'GB) is ' + CAST(r.percent_complete AS NVARCHAR(100)) + '% complete, has been running since ' + CAST(r.start_time AS NVARCHAR(100)) + '. ' 
-		   + CASE WHEN COALESCE(s.nt_user_name, s.login_name) IS NOT NULL THEN (' Login: ' + COALESCE(s.nt_user_name, s.login_name) + ' ') ELSE '' END AS Details,
+        'Backup of ' + DB_NAME(db.resource_database_id) + ' database (' + (SELECT CAST(CAST(SUM(size * 8.0 / 1024 / 1024) AS BIGINT) AS NVARCHAR) FROM #MasterFiles WHERE database_id = db.resource_database_id) + 'GB) ' + @LineFeed
+            + CAST(r.percent_complete AS NVARCHAR(100)) + '% complete, has been running since ' + CAST(r.start_time AS NVARCHAR(100)) + '. ' + @LineFeed
+		    + CASE WHEN COALESCE(s.nt_user_name, s.login_name) IS NOT NULL THEN (' Login: ' + COALESCE(s.nt_user_name, s.login_name) + ' ') ELSE '' END AS Details,
         'KILL ' + CAST(r.session_id AS NVARCHAR(100)) + ';' AS HowToStopIt,
         pl.query_plan AS QueryPlan,
         r.start_time AS StartTime,
@@ -1296,7 +1325,8 @@ BEGIN
     AND     request_owner_type = N'SHARED_TRANSACTION_WORKSPACE') AS db ON s.session_id = db.request_session_id
     CROSS APPLY sys.dm_exec_query_plan(r.plan_handle) pl
     WHERE r.command LIKE 'BACKUP%'
-	AND r.start_time <= DATEADD(minute, -5, GETDATE());
+	AND r.start_time <= DATEADD(minute, -5, GETDATE())
+	AND r.database_id NOT IN (SELECT database_id FROM #ReadableDBs);
 
     /* If there's a backup running, add details explaining how long full backup has been taking in the last month. */
     IF @Seconds > 0 AND CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) <> 'SQL Azure'
@@ -1338,7 +1368,9 @@ BEGIN
     CROSS APPLY sys.dm_exec_query_plan(r.plan_handle) pl
     CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) AS t
     WHERE r.command LIKE 'DBCC%'
-	AND CAST(t.text AS NVARCHAR(4000)) NOT LIKE '%dm_db_index_physical_stats%';
+	AND CAST(t.text AS NVARCHAR(4000)) NOT LIKE '%dm_db_index_physical_stats%'
+	AND CAST(t.text AS NVARCHAR(4000)) NOT LIKE '%ALTER INDEX%'
+	AND r.database_id NOT IN (SELECT database_id FROM #ReadableDBs);
 
 
     /* Maintenance Tasks Running - Restore Running - CheckID 3 */
@@ -1370,7 +1402,9 @@ BEGIN
     AND     request_mode = N'S'
     AND     request_status = N'GRANT') AS db ON s.session_id = db.request_session_id
     CROSS APPLY sys.dm_exec_query_plan(r.plan_handle) pl
-    WHERE r.command LIKE 'RESTORE%';
+    WHERE r.command LIKE 'RESTORE%'
+    AND s.program_name <> 'SQL Server Log Shipping'
+	AND r.database_id NOT IN (SELECT database_id FROM #ReadableDBs);
 
 
     /* SQL Server Internal Maintenance - Database File Growing - CheckID 4 */
@@ -1397,11 +1431,12 @@ BEGIN
     INNER JOIN sys.dm_exec_requests r ON t.session_id = r.session_id
     INNER JOIN sys.dm_exec_sessions s ON r.session_id = s.session_id
     CROSS APPLY sys.dm_exec_query_plan(r.plan_handle) pl
-    WHERE t.wait_type = 'PREEMPTIVE_OS_WRITEFILEGATHER';
+    WHERE t.wait_type = 'PREEMPTIVE_OS_WRITEFILEGATHER'
+	AND r.database_id NOT IN (SELECT database_id FROM #ReadableDBs);
 
 
     /* Query Problems - Long-Running Query Blocking Others - CheckID 5 */
-    IF @@VERSION NOT LIKE '%Azure%' AND @Seconds > 0 AND EXISTS(SELECT * FROM sys.dm_os_waiting_tasks WHERE wait_type LIKE 'LCK%' AND wait_duration_ms > 30000)
+    IF SERVERPROPERTY('Edition') <> 'SQL Azure' AND @Seconds > 0 AND EXISTS(SELECT * FROM sys.dm_os_waiting_tasks WHERE wait_type LIKE 'LCK%' AND wait_duration_ms > 30000)
     BEGIN
         SET @StringToExecute = N'INSERT INTO #BlitzFirstResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, QueryText, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount)
             SELECT 5 AS CheckID,
@@ -1410,9 +1445,9 @@ BEGIN
                 ''Long-Running Query Blocking Others'' AS Finding,
                 ''http://www.BrentOzar.com/go/blocking'' AS URL,
                 ''Query in '' + COALESCE(DB_NAME(COALESCE((SELECT TOP 1 dbid FROM sys.dm_exec_sql_text(r.sql_handle)),
-                    (SELECT TOP 1 t.dbid FROM master..sysprocesses spBlocker CROSS APPLY sys.dm_exec_sql_text(spBlocker.sql_handle) t WHERE spBlocker.spid = tBlocked.blocking_session_id))), ''(Unknown)'') + '' has a last request start time of '' + CAST(s.last_request_start_time AS NVARCHAR(100)) + ''. Query follows:'' ' 
+                    (SELECT TOP 1 t.dbid FROM master..sysprocesses spBlocker CROSS APPLY sys.dm_exec_sql_text(spBlocker.sql_handle) t WHERE spBlocker.spid = tBlocked.blocking_session_id))), ''(Unknown)'') + '' has a last request start time of '' + CAST(s.last_request_start_time AS NVARCHAR(100)) + ''. Query follows: ' 
 					+ @LineFeed + @LineFeed + 
-					'+ CAST(COALESCE((SELECT TOP 1 [text] FROM sys.dm_exec_sql_text(r.sql_handle)),
+					'''+ CAST(COALESCE((SELECT TOP 1 [text] FROM sys.dm_exec_sql_text(r.sql_handle)),
                     (SELECT TOP 1 [text] FROM master..sysprocesses spBlocker CROSS APPLY sys.dm_exec_sql_text(spBlocker.sql_handle) WHERE spBlocker.spid = tBlocked.blocking_session_id), '''') AS NVARCHAR(2000)) AS Details,
                 ''KILL '' + CAST(tBlocked.blocking_session_id AS NVARCHAR(100)) + '';'' AS HowToStopIt,
                 (SELECT TOP 1 query_plan FROM sys.dm_exec_query_plan(r.plan_handle)) AS QueryPlan,
@@ -1430,10 +1465,13 @@ BEGIN
 	        INNER JOIN sys.dm_exec_sessions s ON tBlocked.blocking_session_id = s.session_id
             LEFT OUTER JOIN sys.dm_exec_requests r ON s.session_id = r.session_id
             INNER JOIN sys.dm_exec_connections c ON s.session_id = c.session_id
-            WHERE tBlocked.wait_type LIKE ''LCK%'' AND tBlocked.wait_duration_ms > 30000;';
+            WHERE tBlocked.wait_type LIKE ''LCK%'' AND tBlocked.wait_duration_ms > 30000
+              /* And the blocking session ID is not blocked by anyone else: */
+              AND NOT EXISTS(SELECT * FROM sys.dm_os_waiting_tasks tBlocking WHERE s.session_id = tBlocking.session_id AND tBlocking.session_id <> tBlocking.blocking_session_id AND tBlocking.blocking_session_id IS NOT NULL)
+			  AND r.database_id NOT IN (SELECT database_id FROM #ReadableDBs);';
 		EXECUTE sp_executesql @StringToExecute;
     END;
-
+	
     /* Query Problems - Plan Cache Erased Recently */
     IF DATEADD(mi, -15, SYSDATETIME()) < (SELECT TOP 1 creation_time FROM sys.dm_exec_query_stats ORDER BY creation_time)
     BEGIN
@@ -1490,31 +1528,44 @@ BEGIN
 
 
     /*Query Problems - Clients using implicit transactions */
-    IF @Seconds > 0
-    INSERT INTO #BlitzFirstResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, QueryText, OpenTransactionCount)
-    SELECT  37 AS CheckId,
-            50 AS Priotity,
-            'Implicit Transactions' AS FindingsGroup,
-            'Queries were found running using implicit transactions',
-            'https://www.brentozar.com/go/ImplicitTransactions/' AS URL,
-            'Database: ' + DB_NAME(s.database_id) + @LineFeed + 'Host: ' + s.[host_name] + @LineFeed + 'Program: ' + s.[program_name]   + @LineFeed + CONVERT(VARCHAR(10), s.open_transaction_count) + ' open transactions since' + CAST  (tat.transaction_begin_time AS NVARCHAR(100)) + '. ' AS Details,
-            'Check client configuration options' AS HowToStopit,
-            tat.transaction_begin_time,
-            s.login_name,
-            s.nt_user_name,
-            s.program_name,
-            s.host_name,
-            s.database_id,
-            DB_NAME(s.database_id) AS DatabaseName,
-            NULL AS Querytext,
-            s.open_transaction_count AS OpenTransactionCount
-    FROM    sys.dm_tran_active_transactions AS tat
-    LEFT JOIN sys.dm_tran_session_transactions AS tst
-    ON tst.transaction_id = tat.transaction_id
-    LEFT JOIN sys.dm_exec_sessions AS s
-    ON s.session_id = tst.session_id
-    WHERE tat.name = 'implicit_transaction';
-
+    IF @Seconds > 0 
+		AND ( @@VERSION NOT LIKE 'Microsoft SQL Server 2005%'
+		AND	  @@VERSION NOT LIKE 'Microsoft SQL Server 2008%'
+		AND	  @@VERSION NOT LIKE 'Microsoft SQL Server 2008 R2%' )
+     BEGIN
+        SET @StringToExecute = N'INSERT INTO #BlitzFirstResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, QueryText, OpenTransactionCount)
+		SELECT  37 AS CheckId,
+		        50 AS Priority,
+		        ''Query Problems'' AS FindingsGroup,
+		        ''Implicit Transactions'',
+		        ''https://www.brentozar.com/go/ImplicitTransactions/'' AS URL,
+		        ''Database: '' + DB_NAME(s.database_id)  + '' '' + CHAR(13) + CHAR(10) +
+				''Host: '' + s.[host_name]  + '' '' + CHAR(13) + CHAR(10) +
+				''Program: '' + s.[program_name]  + '' '' + CHAR(13) + CHAR(10) +
+				CONVERT(NVARCHAR(10), s.open_transaction_count) + 
+				'' open transactions since: '' + 
+				CONVERT(NVARCHAR(30), tat.transaction_begin_time) + ''. '' 
+					AS Details,
+				''Run sp_BlitzWho and check the is_implicit_transaction column to spot the culprits.
+If one of them is a lead blocker, consider killing that query.'' AS HowToStopit,
+		        tat.transaction_begin_time,
+		        s.login_name,
+		        s.nt_user_name,
+		        s.program_name,
+		        s.host_name,
+		        s.database_id,
+		        DB_NAME(s.database_id) AS DatabaseName,
+		        NULL AS Querytext,
+		        s.open_transaction_count AS OpenTransactionCount
+		FROM    sys.dm_tran_active_transactions AS tat
+		LEFT JOIN sys.dm_tran_session_transactions AS tst
+		ON tst.transaction_id = tat.transaction_id
+		LEFT JOIN sys.dm_exec_sessions AS s
+		ON s.session_id = tst.session_id
+		WHERE tat.name = ''implicit_transaction'';
+		'
+		EXECUTE sp_executesql @StringToExecute;
+    END;
 
     /* Query Problems - Query Rolling Back - CheckID 9 */
     IF @Seconds > 0
@@ -1577,27 +1628,28 @@ BEGIN
 			AND cTotal.counter_name = N'Total Server Memory (KB)                                                                                                        '
 		WHERE cFree.object_name LIKE N'%Memory Manager%'
 			AND cFree.counter_name = N'Free Memory (KB)                                                                                                                '
-			AND CAST(cTotal.cntr_value AS BIGINT) > 20480000000
+			AND CAST(cFree.cntr_value AS BIGINT) > 20480000000
 			AND CAST(cTotal.cntr_value AS BIGINT) * .3 <= CAST(cFree.cntr_value AS BIGINT)
             AND CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) NOT LIKE '%Standard%';
 
     /* Server Performance - Target Memory Lower Than Max - CheckID 35 */
-    INSERT INTO #BlitzFirstResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt)
-    SELECT 35 AS CheckID,
-        10 AS Priority,
-        'Server Performance' AS FindingGroup,
-        'Target Memory Lower Than Max' AS Finding,
-        'https://BrentOzar.com/go/target' AS URL,
-		N'Max server memory is ' + CAST(cMax.value_in_use AS NVARCHAR(50)) + N' MB but target server memory is only ' + CAST((CAST(cTarget.cntr_value AS BIGINT) / 1024) AS NVARCHAR(50)) + N' MB,' + @LineFeed
-            + N'indicating that SQL Server may be under external memory pressure or max server memory may be set too high.' AS Details,
-        'Investigate what OS processes are using memory, and double-check the max server memory setting.' AS HowToStopIt
-        FROM sys.configurations cMax
-        INNER JOIN sys.dm_os_performance_counters cTarget ON cTarget.object_name LIKE N'%Memory Manager%'
-	        AND cTarget.counter_name = N'Target Server Memory (KB)                                                                                                       '
-        WHERE cMax.name = 'max server memory (MB)'
-            AND CAST(cMax.value_in_use AS BIGINT) >= 1.5 * (CAST(cTarget.cntr_value AS BIGINT) / 1024)
-            AND CAST(cMax.value_in_use AS BIGINT) < 2147483647 /* Not set to default of unlimited */
-            AND CAST(cTarget.cntr_value AS BIGINT) < .8 * (SELECT available_physical_memory_kb FROM sys.dm_os_sys_memory); /* Target memory less than 80% of physical memory (in case they set max too high) */
+	IF SERVERPROPERTY('Edition') <> 'SQL Azure'
+		INSERT INTO #BlitzFirstResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt)
+		SELECT 35 AS CheckID,
+			10 AS Priority,
+			'Server Performance' AS FindingGroup,
+			'Target Memory Lower Than Max' AS Finding,
+			'https://BrentOzar.com/go/target' AS URL,
+			N'Max server memory is ' + CAST(cMax.value_in_use AS NVARCHAR(50)) + N' MB but target server memory is only ' + CAST((CAST(cTarget.cntr_value AS BIGINT) / 1024) AS NVARCHAR(50)) + N' MB,' + @LineFeed
+				+ N'indicating that SQL Server may be under external memory pressure or max server memory may be set too high.' AS Details,
+			'Investigate what OS processes are using memory, and double-check the max server memory setting.' AS HowToStopIt
+			FROM sys.configurations cMax
+			INNER JOIN sys.dm_os_performance_counters cTarget ON cTarget.object_name LIKE N'%Memory Manager%'
+				AND cTarget.counter_name = N'Target Server Memory (KB)                                                                                                       '
+			WHERE cMax.name = 'max server memory (MB)'
+				AND CAST(cMax.value_in_use AS BIGINT) >= 1.5 * (CAST(cTarget.cntr_value AS BIGINT) / 1024)
+				AND CAST(cMax.value_in_use AS BIGINT) < 2147483647 /* Not set to default of unlimited */
+				AND CAST(cTarget.cntr_value AS BIGINT) < .8 * (SELECT available_physical_memory_kb FROM sys.dm_os_sys_memory); /* Target memory less than 80% of physical memory (in case they set max too high) */
 
     /* Server Info - Database Size, Total GB - CheckID 21 */
     INSERT INTO #BlitzFirstResults (CheckID, Priority, FindingsGroup, Finding, Details, DetailsInt, URL)
@@ -1623,6 +1675,237 @@ BEGIN
     FROM sys.databases
     WHERE database_id > 4;
 
+	/* Server Info - Memory Grants pending - CheckID 39 */
+    INSERT INTO #BlitzFirstResults (CheckID, Priority, FindingsGroup, Finding, Details, DetailsInt, URL)
+    SELECT 39 AS CheckID,
+        50 AS Priority,
+		'Server Performance' AS FindingGroup,
+        'Memory Grants Pending' AS Finding,
+		CAST(PendingGrants.Details AS NVARCHAR(50)) AS Details,
+		PendingGrants.DetailsInt,
+		'https://www.brentozar.com/blitz/memory-grants/' AS URL
+	FROM 
+	(
+		SELECT 
+		COUNT(1) AS Details,
+		COUNT(1) AS DetailsInt
+	FROM sys.dm_exec_query_memory_grants AS Grants
+	WHERE queue_id IS NOT NULL
+	) AS PendingGrants
+	WHERE PendingGrants.Details > 0;
+
+	/* Server Info - Memory Grant/Workspace info - CheckID 40 */
+	DECLARE @MaxWorkspace BIGINT
+	SET @MaxWorkspace = (SELECT CAST(cntr_value AS BIGINT)/1024 FROM #PerfmonStats WHERE counter_name = N'Maximum Workspace Memory (KB)')
+	
+	IF (@MaxWorkspace IS NULL
+	    OR @MaxWorkspace = 0)
+	BEGIN
+		SET @MaxWorkspace = 1
+	END
+
+    INSERT INTO #BlitzFirstResults (CheckID, Priority, FindingsGroup, Finding, Details, DetailsInt, URL)
+    SELECT 40 AS CheckID,
+        251 AS Priority,
+        'Server Info' AS FindingGroup,
+        'Memory Grant/Workspace info' AS Finding,
+		+ 'Grants Outstanding: ' + CAST((SELECT COUNT(*) FROM sys.dm_exec_query_memory_grants WHERE queue_id IS NULL) AS NVARCHAR(50)) + @LineFeed
+		+ 'Total Granted(MB): ' + CAST(ISNULL(SUM(Grants.granted_memory_kb) / 1024, 0) AS NVARCHAR(50)) + @LineFeed
+		+ 'Total WorkSpace(MB): ' + CAST(ISNULL(@MaxWorkspace, 0) AS NVARCHAR(50)) + @LineFeed  
+		+ 'Granted workspace: ' + CAST(ISNULL((CAST(SUM(Grants.granted_memory_kb) / 1024 AS MONEY)
+		                              / CAST(@MaxWorkspace AS MONEY)) * 100, 0) AS NVARCHAR(50)) + '%' + @LineFeed
+		+ 'Oldest Grant in seconds: ' + CAST(ISNULL(DATEDIFF(SECOND, MIN(Grants.request_time), GETDATE()), 0) AS NVARCHAR(50)) AS Details,
+		(SELECT COUNT(*) FROM sys.dm_exec_query_memory_grants WHERE queue_id IS NULL) AS DetailsInt,
+		'http://www.BrentOzar.com/askbrent/' AS URL
+	FROM sys.dm_exec_query_memory_grants AS Grants;
+
+    IF @Seconds > 0
+    BEGIN
+
+    IF EXISTS ( SELECT 1/0
+                FROM sys.all_objects AS ao
+                WHERE ao.name = 'dm_exec_query_profiles' )
+    BEGIN
+
+        IF EXISTS( SELECT 1/0
+                   FROM sys.dm_exec_requests AS r
+                   JOIN sys.dm_exec_sessions AS s
+                       ON r.session_id = s.session_id
+                   WHERE s.host_name IS NOT NULL
+                   AND r.total_elapsed_time > 5000 )
+
+                   SET @StringToExecute = N'
+                   DECLARE @bad_estimate TABLE 
+                     ( 
+                       session_id INT, 
+                       request_id INT, 
+                       estimate_inaccuracy BIT 
+                     );
+                   
+                   INSERT @bad_estimate ( session_id, request_id, estimate_inaccuracy )
+                   SELECT x.session_id, 
+                          x.request_id, 
+                          x.estimate_inaccuracy
+                   FROM (
+                         SELECT deqp.session_id,
+                                deqp.request_id,
+                                CASE WHEN deqp.row_count > ( deqp.estimate_row_count * 10000 )
+                                     THEN 1
+                                     WHEN deqp.row_count < ( deqp.estimate_row_count * 10000 )
+                                     THEN 1
+                                     ELSE 0
+                                END AS estimate_inaccuracy
+                         FROM   sys.dm_exec_query_profiles AS deqp
+                   ) AS x
+                   WHERE x.estimate_inaccuracy = 1
+                   GROUP BY x.session_id, 
+                            x.request_id, 
+                            x.estimate_inaccuracy;
+                   
+                   DECLARE @parallelism_skew TABLE
+                     (
+                       session_id INT, 
+                       request_id INT, 
+                       parallelism_skew BIT     
+                     );
+                   
+                   INSERT @parallelism_skew ( session_id, request_id, parallelism_skew )
+                   SELECT y.session_id,
+                          y.request_id,
+                          y.parallelism_skew
+                   FROM (
+                         SELECT x.session_id, 
+                                x.request_id, 
+                                x.node_id, 
+                                x.thread_id, 
+                                x.row_count, 
+                                x.sum_node_rows, 
+                                x.node_dop,
+                                x.sum_node_rows / x.node_dop AS even_distribution,
+                                x.row_count / (1. * ISNULL(NULLIF(x.sum_node_rows / x.node_dop, 0), 1)) AS skew_percent,
+                                CASE 
+                                    WHEN x.row_count > 10000
+                                    AND x.row_count / (1. * ISNULL(NULLIF(x.sum_node_rows / x.node_dop, 0), 1)) > 2.
+                                    THEN 1
+                                    WHEN x.row_count > 10000
+                                    AND x.row_count / (1. * ISNULL(NULLIF(x.sum_node_rows / x.node_dop, 0), 1)) < 0.5
+                                    THEN 1
+                                    ELSE 0 
+                         	   END AS parallelism_skew
+                         FROM (
+                         	       SELECT deqp.session_id,
+                                              deqp.request_id,
+                                              deqp.node_id,
+                                              deqp.thread_id,
+                         	       	   deqp.row_count,
+                         	       	   SUM(deqp.row_count) 
+                         	       		OVER ( PARTITION BY deqp.session_id,
+                                                                   deqp.request_id,
+                         	       		                    deqp.node_id
+                         	       			   ORDER BY deqp.row_count
+                         	       			   ROWS BETWEEN UNBOUNDED PRECEDING 
+                         	       			   AND UNBOUNDED FOLLOWING ) 
+                         	       			   AS sum_node_rows,
+                         	       	   COUNT(*) 
+                         	       		OVER ( PARTITION BY deqp.session_id,
+                                                                   deqp.request_id,
+                         	       		                    deqp.node_id
+                         	       			   ORDER BY deqp.row_count
+                         	       			   ROWS BETWEEN UNBOUNDED PRECEDING 
+                         	       			   AND UNBOUNDED FOLLOWING ) 
+                         	       			   AS node_dop
+                         	       FROM sys.dm_exec_query_profiles AS deqp
+                         	       WHERE deqp.thread_id > 0
+                         	       AND EXISTS 
+                         	       	(
+                         	       		SELECT 1/0
+                         	       		FROM   sys.dm_exec_query_profiles AS deqp2
+                         	       		WHERE deqp.session_id = deqp2.session_id
+                         	       		AND   deqp.node_id = deqp2.node_id
+                         	       		AND   deqp2.thread_id > 0
+                         	       		GROUP BY deqp2.session_id, deqp2.node_id
+                         	       		HAVING COUNT(deqp2.node_id) > 1
+                         	       	)
+                         	   ) AS x
+                         ) AS y
+                   WHERE y.parallelism_skew = 1
+                   GROUP BY y.session_id, 
+                            y.request_id, 
+                            y.parallelism_skew;
+                   
+                   /*
+                   CheckID 42: Queries in dm_exec_query_profiles showing signs of poor cardinality estimates
+                   */
+                   INSERT INTO #BlitzFirstResults 
+                   (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, QueryText, OpenTransactionCount)
+                   SELECT 42 AS CheckID,
+                          100 AS Priority,
+                          ''Query Performance'' AS FindingsGroup,
+                          ''Queries with 10000x cardinality misestimations'' AS Findings,
+                          ''https://brentozar.com/go/skewedup'' AS URL,
+                          ''The query on SPID '' 
+                              + RTRIM(b.session_id) 
+                              + '' has been running for ''
+                              + RTRIM(r.total_elapsed_time / 1000)
+                              + '' seconds,  with a large cardinality misestimate'' AS Details,
+                          ''No quick fix here: time to dig into the actual execution plan. '' AS HowToStopIt,
+                          r.start_time,
+                          s.login_name,
+                          s.nt_user_name,
+                          s.program_name,
+                          s.host_name,
+                          r.database_id,
+                          DB_NAME(r.database_id),
+                          dest.text,
+                          s.open_transaction_count
+                  FROM @bad_estimate AS b
+                  JOIN sys.dm_exec_requests AS r
+                  ON r.session_id = b.session_id
+                  AND r.request_id = b.request_id
+                  JOIN sys.dm_exec_sessions AS s
+                  ON s.session_id = b.session_id
+                  CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) AS dest;
+
+
+                   /*
+                   CheckID 43: Queries in dm_exec_query_profiles showing signs of unbalanced parallelism
+                   */
+                   INSERT INTO #BlitzFirstResults 
+                   (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, QueryText, OpenTransactionCount)
+                   SELECT 43 AS CheckID,
+                          100 AS Priority,
+                          ''Query Performance'' AS FindingsGroup,
+                          ''Queries with 10000x skewed parallelism'' AS Findings,
+                          ''https://brentozar.com/go/skewedup'' AS URL,
+                          ''The query on SPID '' 
+                              + RTRIM(p.session_id) 
+                              + '' has been running for ''
+                              + RTRIM(r.total_elapsed_time / 1000)
+                              + '' seconds,  with a parallel threads doing uneven work.'' AS Details,
+                          ''No quick fix here: time to dig into the actual execution plan. '' AS HowToStopIt,
+                          r.start_time,
+                          s.login_name,
+                          s.nt_user_name,
+                          s.program_name,
+                          s.host_name,
+                          r.database_id,
+                          DB_NAME(r.database_id),
+                          dest.text,
+                          s.open_transaction_count
+                  FROM @parallelism_skew AS p
+                  JOIN sys.dm_exec_requests AS r
+                  ON r.session_id = p.session_id
+                  AND r.request_id = p.request_id
+                  JOIN sys.dm_exec_sessions AS s
+                  ON s.session_id = p.session_id
+                  CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) AS dest;
+                   ';
+                   
+           EXECUTE sp_executesql @StringToExecute;
+   
+        END
+    END
+
     /* Server Performance - High CPU Utilization CheckID 24 */
     IF @Seconds < 30
         BEGIN
@@ -1644,18 +1927,45 @@ BEGIN
             ) AS y
             WHERE 100 - SystemIdle >= 50;
 
-        INSERT INTO #BlitzFirstResults (CheckID, Priority, FindingsGroup, Finding, Details, DetailsInt, URL)
-        SELECT 23, 250, 'Server Info', 'CPU Utilization', CAST(100 - SystemIdle AS NVARCHAR(20)) + N'%. Ring buffer details: ' + CAST(record AS NVARCHAR(4000)), 100 - SystemIdle, 'http://www.BrentOzar.com/go/cpu'
-            FROM (
-                SELECT record,
-                    record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'int') AS SystemIdle
-                FROM (
-                    SELECT TOP 1 CONVERT(XML, record) AS record
-                    FROM sys.dm_os_ring_buffers
-                    WHERE ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR'
-                    AND record LIKE '%<SystemHealth>%'
-                    ORDER BY timestamp DESC) AS rb
-            ) AS y;
+        IF SERVERPROPERTY('Edition') <> 'SQL Azure'
+			WITH y
+				AS
+				 (
+					 SELECT      CONVERT(VARCHAR(5), 100 - ca.c.value('.', 'INT')) AS system_idle,
+								 CONVERT(VARCHAR(30), rb.event_date) AS event_date,
+								 CONVERT(VARCHAR(8000), rb.record) AS record
+					 FROM
+								 (   SELECT CONVERT(XML, dorb.record) AS record,
+											DATEADD(ms, ( ts.ms_ticks - dorb.timestamp ), GETDATE()) AS event_date
+									 FROM   sys.dm_os_ring_buffers AS dorb
+									 CROSS JOIN
+											( SELECT dosi.ms_ticks FROM sys.dm_os_sys_info AS dosi ) AS ts
+									 WHERE  dorb.ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR'
+									 AND    record LIKE '%<SystemHealth>%' ) AS rb
+					 CROSS APPLY rb.record.nodes('/Record/SchedulerMonitorEvent/SystemHealth/SystemIdle') AS ca(c)
+				 )
+			INSERT INTO #BlitzFirstResults (CheckID, Priority, FindingsGroup, Finding, Details, DetailsInt, URL, HowToStopIt)
+			SELECT TOP 1 
+					23, 
+					250, 
+					'Server Info', 
+					'CPU Utilization', 
+					y.system_idle + N'%. Ring buffer details: ' + CAST(y.record AS NVARCHAR(4000)), 
+					y.system_idle	, 
+					'http://www.BrentOzar.com/go/cpu',
+					STUFF(( SELECT TOP 2147483647
+							  CHAR(10) + CHAR(13)
+							+ y2.system_idle 
+							+ '% ON ' 
+							+ y2.event_date 
+							+ ' Ring buffer details:  '
+							+ y2.record
+					FROM   y AS y2
+					ORDER BY y2.event_date DESC
+					FOR XML PATH(N''), TYPE ).value(N'.[1]', N'VARCHAR(MAX)'), 1, 1, N'') AS query
+			FROM   y
+			ORDER BY y.event_date DESC;
+
 		
 		/* Highlight if non SQL processes are using >25% CPU */
 		INSERT INTO #BlitzFirstResults (CheckID, Priority, FindingsGroup, Finding, Details, DetailsInt, URL)
@@ -1717,50 +2027,12 @@ BEGIN
 			   SUM(os.waiting_tasks_count) OVER (PARTITION BY os.wait_type) AS sum_waiting_tasks
 		   FROM sys.dm_os_wait_stats os
 		) x
-		   WHERE x.wait_type NOT IN (
-                  'BROKER_EVENTHANDLER'
-                , 'BROKER_RECEIVE_WAITFOR'
-                , 'BROKER_TASK_STOP'
-                , 'BROKER_TO_FLUSH'
-                , 'BROKER_TRANSMITTER'
-                , 'CHECKPOINT_QUEUE'
-                , 'DBMIRROR_DBM_EVENT'
-                , 'DBMIRROR_DBM_MUTEX'
-                , 'DBMIRROR_EVENTS_QUEUE'
-                , 'DBMIRROR_WORKER_QUEUE'
-                , 'DBMIRRORING_CMD'
-                , 'DIRTY_PAGE_POLL'
-                , 'DISPATCHER_QUEUE_SEMAPHORE'
-                , 'FT_IFTS_SCHEDULER_IDLE_WAIT'
-                , 'FT_IFTSHC_MUTEX'
-                , 'HADR_CLUSAPI_CALL'
-                , 'HADR_FILESTREAM_IOMGR_IOCOMPLETION'
-                , 'HADR_LOGCAPTURE_WAIT'
-                , 'HADR_NOTIFICATION_DEQUEUE'
-                , 'HADR_TIMER_TASK'
-                , 'HADR_WORK_QUEUE'
-                , 'LAZYWRITER_SLEEP'
-                , 'LOGMGR_QUEUE'
-                , 'ONDEMAND_TASK_QUEUE'
-                , 'PREEMPTIVE_HADR_LEASE_MECHANISM'
-                , 'PREEMPTIVE_SP_SERVER_DIAGNOSTICS'
-                , 'QDS_ASYNC_QUEUE'
-                , 'QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP'
-                , 'QDS_PERSIST_TASK_MAIN_LOOP_SLEEP'
-                , 'QDS_SHUTDOWN_QUEUE'
-                , 'REDO_THREAD_PENDING_WORK'
-                , 'REQUEST_FOR_DEADLOCK_SEARCH'
-                , 'SLEEP_SYSTEMTASK'
-                , 'SLEEP_TASK'
-                , 'SP_SERVER_DIAGNOSTICS_SLEEP'
-                , 'SQLTRACE_BUFFER_FLUSH'
-                , 'SQLTRACE_INCREMENTAL_FLUSH_SLEEP'
-                , 'UCS_SESSION_REGISTRATION'
-                , 'WAIT_XTP_OFFLINE_CKPT_NEW_LOG'
-                , 'WAITFOR'
-                , 'XE_DISPATCHER_WAIT'
-                , 'XE_LIVE_TARGET_TVF'
-                , 'XE_TIMER_EVENT'
+		   WHERE EXISTS 
+		   (
+                SELECT 1/0
+				FROM ##WaitCategories AS wc
+				WHERE wc.WaitType = x.wait_type
+				AND wc.Ignorable = 0
 		   )
 		GROUP BY x.Pass, x.SampleTime, x.wait_type
 		ORDER BY sum_wait_time_ms DESC;
@@ -2047,7 +2319,8 @@ BEGIN
         ((wNow.wait_time_ms - COALESCE(wBase.wait_time_ms,0)) / 1000) AS DetailsInt
     FROM #WaitStats wNow
     LEFT OUTER JOIN #WaitStats wBase ON wNow.wait_type = wBase.wait_type AND wNow.SampleTime > wBase.SampleTime
-    WHERE wNow.wait_type IN ('IO_QUEUE_LIMIT', 'IO_RETRY', 'LOG_RATE_GOVERNOR', 'PREEMPTIVE_DEBUG', 'RESMGR_THROTTLED', 'RESOURCE_SEMAPHORE', 'RESOURCE_SEMAPHORE_QUERY_COMPILE','SE_REPL_CATCHUP_THROTTLE','SE_REPL_COMMIT_ACK','SE_REPL_COMMIT_TURN','SE_REPL_ROLLBACK_ACK','SE_REPL_SLOW_SECONDARY_THROTTLE','THREADPOOL') AND wNow.wait_time_ms > wBase.wait_time_ms;
+    WHERE wNow.wait_type IN ('IO_QUEUE_LIMIT', 'IO_RETRY', 'LOG_RATE_GOVERNOR', 'POOL_LOG_RATE_GOVERNOR', 'PREEMPTIVE_DEBUG', 'RESMGR_THROTTLED', 'RESOURCE_SEMAPHORE', 'RESOURCE_SEMAPHORE_QUERY_COMPILE','SE_REPL_CATCHUP_THROTTLE','SE_REPL_COMMIT_ACK','SE_REPL_COMMIT_TURN','SE_REPL_ROLLBACK_ACK','SE_REPL_SLOW_SECONDARY_THROTTLE','THREADPOOL') 
+	  AND wNow.wait_time_ms > (wBase.wait_time_ms + 1000);
 
 
     /* Server Performance - Slow Data File Reads - CheckID 11 */
@@ -2246,7 +2519,28 @@ BEGIN
         AND ps.counter_name = 'Suboptimal plans/sec'
         AND ps.value_delta > (10 * @Seconds); /* Ignore servers sitting idle */
 
-
+    /* Azure Performance - Database is Maxed Out - CheckID 41 */
+    IF SERVERPROPERTY('Edition') = 'SQL Azure'
+        INSERT INTO #BlitzFirstResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt)
+        SELECT 41 AS CheckID,
+            10 AS Priority,
+            'Azure Performance' AS FindingGroup,
+            'Database is Maxed Out' AS Finding,
+            'https://BrentOzar.com/go/maxedout' AS URL,
+            N'At ' + CONVERT(NVARCHAR(100), s.end_time ,121) + N', your database approached (or hit) your DTU limits:' + @LineFeed
+                + N'Average CPU percent: ' + CAST(avg_cpu_percent AS NVARCHAR(50)) + @LineFeed
+                + N'Average data IO percent: ' + CAST(avg_data_io_percent AS NVARCHAR(50)) + @LineFeed
+                + N'Average log write percent: ' + CAST(avg_log_write_percent AS NVARCHAR(50)) + @LineFeed
+                + N'Max worker percent: ' + CAST(max_worker_percent AS NVARCHAR(50)) + @LineFeed
+                + N'Max session percent: ' + CAST(max_session_percent AS NVARCHAR(50)) AS Details,
+            'Tune your queries or indexes with sp_BlitzCache or sp_BlitzIndex, or consider upgrading to a higher DTU level.' AS HowToStopIt
+        FROM sys.dm_db_resource_stats s
+        WHERE s.end_time >= DATEADD(MI, -5, GETDATE())
+          AND (avg_cpu_percent > 90
+               OR avg_data_io_percent >= 90
+               OR avg_log_write_percent >=90
+               OR max_worker_percent >= 90
+               OR max_session_percent >= 90);
 
     /* Server Info - Batch Requests per Sec - CheckID 19 */
     INSERT INTO #BlitzFirstResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, DetailsInt)
@@ -2255,7 +2549,7 @@ BEGIN
         'Server Info' AS FindingGroup,
         'Batch Requests per Sec' AS Finding,
         'http://www.BrentOzar.com/go/measure' AS URL,
-        CAST(ps.value_delta / (DATEDIFF(ss, ps1.SampleTime, ps.SampleTime)) AS NVARCHAR(20)) AS Details,
+        CAST(CAST(ps.value_delta AS MONEY) / (DATEDIFF(ss, ps1.SampleTime, ps.SampleTime)) AS NVARCHAR(20)) AS Details,
         ps.value_delta / (DATEDIFF(ss, ps1.SampleTime, ps.SampleTime)) AS DetailsInt
     FROM #PerfmonStats ps
         INNER JOIN #PerfmonStats ps1 ON ps.object_name = ps1.object_name AND ps.counter_name = ps1.counter_name AND ps1.Pass = 1
@@ -2306,12 +2600,12 @@ BEGIN
         waits2(SampleTime, waits_ms) AS (SELECT SampleTime, SUM(ws2.wait_time_ms) FROM #WaitStats ws2 WHERE ws2.Pass = 2 GROUP BY SampleTime),
         cores(cpu_count) AS (SELECT SUM(1) FROM sys.dm_os_schedulers WHERE status = 'VISIBLE ONLINE' AND is_online = 1)
         INSERT INTO #BlitzFirstResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, DetailsInt)
-        SELECT 19 AS CheckID,
+        SELECT 20 AS CheckID,
             250 AS Priority,
             'Server Info' AS FindingGroup,
             'Wait Time per Core per Sec' AS Finding,
             'http://www.BrentOzar.com/go/measure' AS URL,
-            CAST((waits2.waits_ms - waits1.waits_ms) / 1000 / i.cpu_count / DATEDIFF(ss, waits1.SampleTime, waits2.SampleTime) AS NVARCHAR(20)) AS Details,
+            CAST((CAST(waits2.waits_ms - waits1.waits_ms AS MONEY)) / 1000 / i.cpu_count / DATEDIFF(ss, waits1.SampleTime, waits2.SampleTime) AS NVARCHAR(20)) AS Details,
             (waits2.waits_ms - waits1.waits_ms) / 1000 / i.cpu_count / DATEDIFF(ss, waits1.SampleTime, waits2.SampleTime) AS DetailsInt
         FROM cores i
           CROSS JOIN waits1
@@ -2352,7 +2646,7 @@ BEGIN
                     ORDER BY timestamp DESC) AS rb
             ) AS y;
 
-        END; /* IF @Seconds < 30 */
+        END; /* IF @Seconds >= 30 */
 
 
     /* If we didn't find anything, apologize. */
@@ -2430,6 +2724,12 @@ BEGIN
                                         'Some things get better with age, like fine wine and your T-SQL. However, sp_BlitzFirst is not one of those things - time to go download the current one.' AS Details;
                     END;
 
+    IF @CheckServerInfo = 0 /* Github #1680 */
+        BEGIN
+        DELETE #BlitzFirstResults
+          WHERE FindingsGroup = 'Server Info';
+        END
+
     RAISERROR('Analysis finished, outputting results',10,1) WITH NOWAIT;
 
 
@@ -2441,56 +2741,29 @@ BEGIN
                      FROM   sys.databases
                      WHERE  QUOTENAME([name]) = @OutputDatabaseName)
     BEGIN
-    	RAISERROR('Calling sp_BlitzCache',10,1) WITH NOWAIT;
+    	DECLARE	@v DECIMAL(6,2),
+			@build INT,
+			@memGrantSortSupported BIT = 1;
 
-        /* Set the sp_BlitzCache sort order based on their top wait type */
+		RAISERROR (N'Determining SQL Server version.',0,1) WITH NOWAIT;
 
-        /* First, check for poison waits - CheckID 30 */
-        IF EXISTS (SELECT * FROM #BlitzFirstResults WHERE CheckID = 30)
-            BEGIN
-            SELECT TOP 1 @BlitzCacheSortOrder = CASE
-                                                WHEN Finding = 'Poison Wait Detected: RESOURCE_SEMAPHORE' THEN 'memory grant'
-                                                WHEN Finding = 'Poison Wait Detected: RESOURCE_SEMAPHORE_QUERY_COMPILE' THEN 'memory grant'
-                                                WHEN Finding = 'Poison Wait Detected: THREADPOOL' THEN 'executions'
-                                                WHEN Finding = 'Poison Wait Detected: LOG_RATE_GOVERNOR' THEN 'writes'
-                                                WHEN Finding = 'Poison Wait Detected: SE_REPL_CATCHUP_THROTTLE' THEN 'writes'
-                                                WHEN Finding = 'Poison Wait Detected: SE_REPL_COMMIT_ACK' THEN 'writes'
-                                                WHEN Finding = 'Poison Wait Detected: SE_REPL_ROLLBACK_ACK' THEN 'writes'
-                                                WHEN Finding = 'Poison Wait Detected: SE_REPL_SLOW_SECONDARY_THROTTLE' THEN 'writes'
-                                            ELSE NULL
-                                            END
-                FROM #BlitzFirstResults
-                WHERE CheckID = 30
-                ORDER BY DetailsInt DESC;
-            END;
+		INSERT INTO #checkversion (version)
+		SELECT CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128))
+		OPTION (RECOMPILE);
 
-        /* Too much free memory - which probably indicates queries finished w/huge grants - CheckID 34 */
-        IF @BlitzCacheSortOrder IS NULL AND EXISTS (SELECT * FROM #BlitzFirstResults WHERE CheckID = 34)
-            SET @BlitzCacheSortOrder = 'memory grant';
 
-        /* Next, Compilations/Sec High - CheckID 15 and 16 */
-        IF @BlitzCacheSortOrder IS NULL AND EXISTS (SELECT * FROM #BlitzFirstResults WHERE CheckID IN (15,16))
-            SET @BlitzCacheSortOrder = 'compilations';
+		SELECT @v = common_version ,
+			   @build = build
+		FROM   #checkversion
+		OPTION (RECOMPILE);
 
-        /* Still not set? Use the top wait type. */
-        IF @BlitzCacheSortOrder IS NULL AND EXISTS (SELECT * FROM #BlitzFirstResults WHERE CheckID = 6)
-            BEGIN
-            SELECT TOP 1 @BlitzCacheSortOrder = CASE
-                                                WHEN Finding = 'ASYNC_NETWORK_IO' THEN 'duration'
-                                                WHEN Finding = 'CXPACKET' THEN 'reads'
-                                                WHEN Finding = 'LATCH_EX' THEN 'reads'
-                                                WHEN Finding LIKE 'LCK%' THEN 'duration'
-                                                WHEN Finding LIKE 'PAGEIOLATCH%' THEN 'reads'
-                                                WHEN Finding = 'SOS_SCHEDULER_YIELD' THEN 'cpu'
-                                                WHEN Finding = 'WRITELOG' THEN 'writes'
-                                            ELSE NULL
-                                            END
-                FROM #BlitzFirstResults
-                WHERE CheckID = 6
-                ORDER BY DetailsInt DESC;
-            END;
-        /* Still null? Just use the default. */
+		IF (@v < 11)
+		OR (@v = 11 AND @build < 6020) 
+		OR (@v = 12 AND @build < 5000) 
+		OR (@v = 13 AND @build < 1601)
+			SET @memGrantSortSupported = 0;
 
+		RAISERROR('Calling sp_BlitzCache',10,1) WITH NOWAIT;
 
 
         /* If they have an newer version of sp_BlitzCache that supports @MinutesBack and @CheckDateOverride */
@@ -2515,23 +2788,15 @@ BEGIN
                 IF @BlitzCacheMinutesBack IS NULL OR @BlitzCacheMinutesBack < 1 OR @BlitzCacheMinutesBack > 60
                     SET @BlitzCacheMinutesBack = 15;
 
-                IF @BlitzCacheSortOrder IS NOT NULL
-                    EXEC sp_BlitzCache
-                        @OutputDatabaseName = @UnquotedOutputDatabaseName,
-                        @OutputSchemaName = @UnquotedOutputSchemaName,
-                        @OutputTableName = @OutputTableNameBlitzCache,
-                        @CheckDateOverride = @StartSampleTime,
-                        @SortOrder = @BlitzCacheSortOrder,
-                        @MinutesBack = @BlitzCacheMinutesBack,
-                        @Debug = @Debug;
-                ELSE
-                    EXEC sp_BlitzCache
-                        @OutputDatabaseName = @UnquotedOutputDatabaseName,
-                        @OutputSchemaName = @UnquotedOutputSchemaName,
-                        @OutputTableName = @OutputTableNameBlitzCache,
-                        @CheckDateOverride = @StartSampleTime,
-                        @MinutesBack = @BlitzCacheMinutesBack,
-                        @Debug = @Debug;
+                EXEC sp_BlitzCache
+                    @OutputDatabaseName = @UnquotedOutputDatabaseName,
+                    @OutputSchemaName = @UnquotedOutputSchemaName,
+                    @OutputTableName = @OutputTableNameBlitzCache,
+                    @CheckDateOverride = @StartSampleTime,
+                    @SortOrder = 'all',
+                    @SkipAnalysis = 1,
+                    @MinutesBack = @BlitzCacheMinutesBack,
+                    @Debug = @Debug;
 
                 /* Delete history older than @OutputTableRetentionDays */
                 SET @StringToExecute = N' IF EXISTS(SELECT * FROM '
@@ -2541,10 +2806,10 @@ BEGIN
                     + @OutputDatabaseName + '.'
                     + @OutputSchemaName + '.'
                     + QUOTENAME(@OutputTableNameBlitzCache)
-                    + ' WHERE ServerName = '''
-                    + CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128))
-                    + ''' AND CheckDate < ''' + CAST(CAST( (DATEADD(DAY, -1 * @OutputTableRetentionDays, GETDATE() ) ) AS DATE) AS NVARCHAR(20)) + ''';';
-                EXEC(@StringToExecute);
+                    + ' WHERE ServerName = @SrvName AND CheckDate < @CheckDate;';
+                EXEC sp_executesql @StringToExecute,
+					N'@SrvName NVARCHAR(128), @CheckDate date',
+					@@SERVERNAME, @OutputTableCleanupDate;
 
 
             END;
@@ -2615,9 +2880,10 @@ BEGIN
                 DatabaseName NVARCHAR(128) NULL,
                 OpenTransactionCount INT NULL,
                 DetailsInt INT NULL,
-                CONSTRAINT [PK_' + CAST(NEWID() AS CHAR(36)) + '] PRIMARY KEY CLUSTERED (ID ASC));';
+                PRIMARY KEY CLUSTERED (ID ASC));';
 
         EXEC(@StringToExecute);
+
         SET @StringToExecute = N' IF EXISTS(SELECT * FROM '
             + @OutputDatabaseName
             + '.INFORMATION_SCHEMA.SCHEMATA WHERE QUOTENAME(SCHEMA_NAME) = '''
@@ -2625,10 +2891,12 @@ BEGIN
             + @OutputDatabaseName + '.'
             + @OutputSchemaName + '.'
             + @OutputTableName
-            + ' (ServerName, CheckDate, CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, QueryText, StartTime, LoginName, NTUserName, OriginalLoginName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount, DetailsInt) SELECT '''
-            + CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128))
-            + ''', ''' + (CONVERT(NVARCHAR(100), @StartSampleTime, 121)) + ''', CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, QueryText, StartTime, LoginName, NTUserName, OriginalLoginName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount, DetailsInt FROM #BlitzFirstResults ORDER BY Priority , FindingsGroup , Finding , Details';
-        EXEC(@StringToExecute);
+            + ' (ServerName, CheckDate, CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, QueryText, StartTime, LoginName, NTUserName, OriginalLoginName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount, DetailsInt) SELECT '
+            + ' @SrvName, @CheckDate, CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, QueryText, StartTime, LoginName, NTUserName, OriginalLoginName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount, DetailsInt FROM #BlitzFirstResults ORDER BY Priority , FindingsGroup , Finding , Details';
+		
+		EXEC sp_executesql @StringToExecute,
+			N'@SrvName NVARCHAR(128), @CheckDate datetimeoffset',
+			@@SERVERNAME, @StartSampleTime;
 
         /* Delete history older than @OutputTableRetentionDays */
         SET @StringToExecute = N' IF EXISTS(SELECT * FROM '
@@ -2638,11 +2906,11 @@ BEGIN
             + @OutputDatabaseName + '.'
             + @OutputSchemaName + '.'
             + @OutputTableName
-            + ' WHERE ServerName = '''
-            + CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128))
-            + ''' AND CheckDate < ''' + CAST(CAST( (DATEADD(DAY, -1 * @OutputTableRetentionDays, GETDATE() ) ) AS DATE) AS NVARCHAR(20)) + ''';';
-        EXEC(@StringToExecute);
-
+            + ' WHERE ServerName = @SrvName AND CheckDate < @CheckDate ;';
+		
+		EXEC sp_executesql @StringToExecute,
+			N'@SrvName NVARCHAR(128), @CheckDate date',
+			@@SERVERNAME, @OutputTableCleanupDate;
 
     END;
     ELSE IF (SUBSTRING(@OutputTableName, 2, 2) = '##')
@@ -2673,13 +2941,15 @@ BEGIN
                 DatabaseName NVARCHAR(128) NULL,
                 OpenTransactionCount INT NULL,
                 DetailsInt INT NULL,
-                CONSTRAINT [PK_' + CAST(NEWID() AS CHAR(36)) + '] PRIMARY KEY CLUSTERED (ID ASC));'
+                PRIMARY KEY CLUSTERED (ID ASC));'
             + ' INSERT '
             + @OutputTableName
-            + ' (ServerName, CheckDate, CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, QueryText, StartTime, LoginName, NTUserName, OriginalLoginName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount, DetailsInt) SELECT '''
-            + CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128))
-            + ''', ''' + CONVERT(NVARCHAR(100), @StartSampleTime, 121) + ''', CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, QueryText, StartTime, LoginName, NTUserName, OriginalLoginName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount, DetailsInt FROM #BlitzFirstResults ORDER BY Priority , FindingsGroup , Finding , Details';
-        EXEC(@StringToExecute);
+            + ' (ServerName, CheckDate, CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, QueryText, StartTime, LoginName, NTUserName, OriginalLoginName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount, DetailsInt) SELECT '
+            + ' @SrvName, @CheckDate, CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, QueryText, StartTime, LoginName, NTUserName, OriginalLoginName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount, DetailsInt FROM #BlitzFirstResults ORDER BY Priority , FindingsGroup , Finding , Details';
+		
+		EXEC sp_executesql @StringToExecute,
+			N'@SrvName NVARCHAR(128), @CheckDate datetimeoffset',
+			@@SERVERNAME, @StartSampleTime;
     END;
     ELSE IF (SUBSTRING(@OutputTableName, 2, 1) = '#')
     BEGIN
@@ -2725,8 +2995,9 @@ BEGIN
                 num_of_writes BIGINT ,
                 bytes_written BIGINT,
                 PhysicalName NVARCHAR(520) ,
-                CONSTRAINT [PK_' + CAST(NEWID() AS CHAR(36)) + '] PRIMARY KEY CLUSTERED (ID ASC));';
-        EXEC(@StringToExecute);
+                PRIMARY KEY CLUSTERED (ID ASC));';
+
+		EXEC(@StringToExecute);
 
         /* Create the view */
         SET @ObjectFullName = @OutputDatabaseName + N'.' + @OutputSchemaName + N'.' +  @OutputTableNameFileStats_View;
@@ -2737,24 +3008,63 @@ BEGIN
                 + '; EXEC (''CREATE VIEW '
                 + @OutputSchemaName + '.'
                 + @OutputTableNameFileStats_View + ' AS ' + @LineFeed
-                + 'SELECT f.ServerName, f.CheckDate, f.DatabaseID, f.DatabaseName, f.FileID, f.FileLogicalName, f.TypeDesc, f.PhysicalName, f.SizeOnDiskMB' + @LineFeed
-                + ', DATEDIFF(ss, fPrior.CheckDate, f.CheckDate) AS ElapsedSeconds' + @LineFeed
-                + ', (f.SizeOnDiskMB - fPrior.SizeOnDiskMB) AS SizeOnDiskMBgrowth' + @LineFeed
-                + ', (f.io_stall_read_ms - fPrior.io_stall_read_ms) AS io_stall_read_ms' + @LineFeed
-                + ', io_stall_read_ms_average = CASE WHEN (f.num_of_reads - fPrior.num_of_reads) = 0 THEN 0 ELSE (f.io_stall_read_ms - fPrior.io_stall_read_ms) / (f.num_of_reads - fPrior.num_of_reads) END' + @LineFeed
-                + ', (f.num_of_reads - fPrior.num_of_reads) AS num_of_reads' + @LineFeed
-                + ', (f.bytes_read - fPrior.bytes_read) / 1024.0 / 1024.0 AS megabytes_read' + @LineFeed
-                + ', (f.io_stall_write_ms - fPrior.io_stall_write_ms) AS io_stall_write_ms' + @LineFeed
-                + ', io_stall_write_ms_average = CASE WHEN (f.num_of_writes - fPrior.num_of_writes) = 0 THEN 0 ELSE (f.io_stall_write_ms - fPrior.io_stall_write_ms) / (f.num_of_writes - fPrior.num_of_writes) END' + @LineFeed
-                + ', (f.num_of_writes - fPrior.num_of_writes) AS num_of_writes' + @LineFeed
-                + ', (f.bytes_written - fPrior.bytes_written) / 1024.0 / 1024.0 AS megabytes_written' + @LineFeed
-                + 'FROM ' + @OutputSchemaName + '.' + @OutputTableNameFileStats + ' f' + @LineFeed
-                + 'INNER JOIN ' + @OutputSchemaName + '.' + @OutputTableNameFileStats + ' fPrior ON f.ServerName = fPrior.ServerName AND f.DatabaseID = fPrior.DatabaseID AND f.FileID = fPrior.FileID AND f.CheckDate > fPrior.CheckDate' + @LineFeed
-                + 'LEFT OUTER JOIN ' + @OutputSchemaName + '.' + @OutputTableNameFileStats + ' fMiddle ON f.ServerName = fMiddle.ServerName AND f.DatabaseID = fMiddle.DatabaseID AND f.FileID = fMiddle.FileID AND f.CheckDate > fMiddle.CheckDate AND fMiddle.CheckDate > fPrior.CheckDate' + @LineFeed
-                + 'WHERE fMiddle.ID IS NULL AND f.num_of_reads >= fPrior.num_of_reads AND f.num_of_writes >= fPrior.num_of_writes
-                    AND DATEDIFF(MI, fPrior.CheckDate, f.CheckDate) BETWEEN 1 AND 60;'')';
-            EXEC(@StringToExecute);
+                + 'WITH RowDates as' + @LineFeed
+                + '(' + @LineFeed
+                + '        SELECT ' + @LineFeed
+                + '                ROW_NUMBER() OVER (ORDER BY [ServerName], [CheckDate]) ID,' + @LineFeed
+                + '                [CheckDate]' + @LineFeed
+                + '        FROM ' + @OutputSchemaName + '.' + @OutputTableNameFileStats + '' + @LineFeed
+                + '        GROUP BY [ServerName], [CheckDate]' + @LineFeed
+                + '),' + @LineFeed
+                + 'CheckDates as' + @LineFeed
+                + '(' + @LineFeed
+                + '        SELECT ThisDate.CheckDate,' + @LineFeed
+                + '               LastDate.CheckDate as PreviousCheckDate' + @LineFeed
+                + '        FROM RowDates ThisDate' + @LineFeed
+                + '        JOIN RowDates LastDate' + @LineFeed
+                + '        ON ThisDate.ID = LastDate.ID + 1' + @LineFeed
+                + ')' + @LineFeed
+                + '     SELECT f.ServerName,' + @LineFeed
+                + '            f.CheckDate,' + @LineFeed
+                + '            f.DatabaseID,' + @LineFeed
+                + '            f.DatabaseName,' + @LineFeed
+                + '            f.FileID,' + @LineFeed
+                + '            f.FileLogicalName,' + @LineFeed
+                + '            f.TypeDesc,' + @LineFeed
+                + '            f.PhysicalName,' + @LineFeed
+                + '            f.SizeOnDiskMB,' + @LineFeed
+                + '            DATEDIFF(ss, fPrior.CheckDate, f.CheckDate) AS ElapsedSeconds,' + @LineFeed
+                + '            (f.SizeOnDiskMB - fPrior.SizeOnDiskMB) AS SizeOnDiskMBgrowth,' + @LineFeed
+                + '            (f.io_stall_read_ms - fPrior.io_stall_read_ms) AS io_stall_read_ms,' + @LineFeed
+                + '            io_stall_read_ms_average = CASE' + @LineFeed
+                + '                                           WHEN(f.num_of_reads - fPrior.num_of_reads) = 0' + @LineFeed
+                + '                                           THEN 0' + @LineFeed
+                + '                                           ELSE(f.io_stall_read_ms - fPrior.io_stall_read_ms) /     (f.num_of_reads   -           fPrior.num_of_reads)' + @LineFeed
+                + '                                       END,' + @LineFeed
+                + '            (f.num_of_reads - fPrior.num_of_reads) AS num_of_reads,' + @LineFeed
+                + '            (f.bytes_read - fPrior.bytes_read) / 1024.0 / 1024.0 AS megabytes_read,' + @LineFeed
+                + '            (f.io_stall_write_ms - fPrior.io_stall_write_ms) AS io_stall_write_ms,' + @LineFeed
+                + '            io_stall_write_ms_average = CASE' + @LineFeed
+                + '                                            WHEN(f.num_of_writes - fPrior.num_of_writes) = 0' + @LineFeed
+                + '                                            THEN 0' + @LineFeed
+                + '                                            ELSE(f.io_stall_write_ms - fPrior.io_stall_write_ms) /         (f.num_of_writes   -       fPrior.num_of_writes)' + @LineFeed
+                + '                                        END,' + @LineFeed
+                + '            (f.num_of_writes - fPrior.num_of_writes) AS num_of_writes,' + @LineFeed
+                + '            (f.bytes_written - fPrior.bytes_written) / 1024.0 / 1024.0 AS megabytes_written' + @LineFeed
+                + '     FROM   ' + @OutputSchemaName + '.' + @OutputTableNameFileStats + ' f' + @LineFeed
+                + '            INNER HASH JOIN CheckDates DATES ON f.CheckDate = DATES.CheckDate' + @LineFeed
+                + '            INNER JOIN ' + @OutputSchemaName + '.' + @OutputTableNameFileStats + ' fPrior ON f.ServerName =                 fPrior.ServerName' + @LineFeed
+                + '                                                              AND f.DatabaseID = fPrior.DatabaseID' +     @LineFeed
+                + '                                                              AND f.FileID = fPrior.FileID' + @LineFeed
+                + '                                                              AND fPrior.CheckDate =   DATES.PreviousCheckDate'   +           @LineFeed
+                + '' + @LineFeed
+                + '     WHERE  f.num_of_reads >= fPrior.num_of_reads' + @LineFeed
+                + '            AND f.num_of_writes >= fPrior.num_of_writes' + @LineFeed
+                + '            AND DATEDIFF(MI, fPrior.CheckDate, f.CheckDate) BETWEEN 1 AND 60;'')'
+
+			EXEC(@StringToExecute);
             END;
+
 
         SET @StringToExecute = N' IF EXISTS(SELECT * FROM '
             + @OutputDatabaseName
@@ -2763,11 +3073,12 @@ BEGIN
             + @OutputDatabaseName + '.'
             + @OutputSchemaName + '.'
             + @OutputTableNameFileStats
-            + ' (ServerName, CheckDate, DatabaseID, FileID, DatabaseName, FileLogicalName, TypeDesc, SizeOnDiskMB, io_stall_read_ms, num_of_reads, bytes_read, io_stall_write_ms, num_of_writes, bytes_written, PhysicalName) SELECT '''
-            + CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128))
-            + ''', ''' + CONVERT(NVARCHAR(100), @StartSampleTime, 121) + ''', '
-            + 'DatabaseID, FileID, DatabaseName, FileLogicalName, TypeDesc, SizeOnDiskMB, io_stall_read_ms, num_of_reads, bytes_read, io_stall_write_ms, num_of_writes, bytes_written, PhysicalName FROM #FileStats WHERE Pass = 2';
-        EXEC(@StringToExecute);
+            + ' (ServerName, CheckDate, DatabaseID, FileID, DatabaseName, FileLogicalName, TypeDesc, SizeOnDiskMB, io_stall_read_ms, num_of_reads, bytes_read, io_stall_write_ms, num_of_writes, bytes_written, PhysicalName) SELECT '
+            + ' @SrvName, @CheckDate, DatabaseID, FileID, DatabaseName, FileLogicalName, TypeDesc, SizeOnDiskMB, io_stall_read_ms, num_of_reads, bytes_read, io_stall_write_ms, num_of_writes, bytes_written, PhysicalName FROM #FileStats WHERE Pass = 2';
+
+		EXEC sp_executesql @StringToExecute,
+			N'@SrvName NVARCHAR(128), @CheckDate datetimeoffset',
+			@@SERVERNAME, @StartSampleTime;
 
         /* Delete history older than @OutputTableRetentionDays */
         SET @StringToExecute = N' IF EXISTS(SELECT * FROM '
@@ -2777,10 +3088,11 @@ BEGIN
             + @OutputDatabaseName + '.'
             + @OutputSchemaName + '.'
             + @OutputTableNameFileStats
-            + ' WHERE ServerName = '''
-            + CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128))
-            + ''' AND CheckDate < ''' + CAST(CAST( (DATEADD(DAY, -1 * @OutputTableRetentionDays, GETDATE() ) ) AS DATE) AS NVARCHAR(20)) + ''';';
-        EXEC(@StringToExecute);
+            + ' WHERE ServerName = @SrvName AND CheckDate < @CheckDate ;';
+
+		EXEC sp_executesql @StringToExecute,
+			N'@SrvName NVARCHAR(128), @CheckDate date',
+			@@SERVERNAME, @OutputTableCleanupDate;
 
     END;
     ELSE IF (SUBSTRING(@OutputTableNameFileStats, 2, 2) = '##')
@@ -2806,14 +3118,15 @@ BEGIN
                 bytes_written BIGINT,
                 PhysicalName NVARCHAR(520) ,
                 DetailsInt INT NULL,
-                CONSTRAINT [PK_' + CAST(NEWID() AS CHAR(36)) + '] PRIMARY KEY CLUSTERED (ID ASC));'
+                PRIMARY KEY CLUSTERED (ID ASC));'
             + ' INSERT '
             + @OutputTableNameFileStats
-            + ' (ServerName, CheckDate, DatabaseID, FileID, DatabaseName, FileLogicalName, TypeDesc, SizeOnDiskMB, io_stall_read_ms, num_of_reads, bytes_read, io_stall_write_ms, num_of_writes, bytes_written, PhysicalName) SELECT '''
-            + CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128))
-            + ''', ''' + CONVERT(NVARCHAR(100), @StartSampleTime, 121) + ''', '
-            + 'DatabaseID, FileID, DatabaseName, FileLogicalName, TypeDesc, SizeOnDiskMB, io_stall_read_ms, num_of_reads, bytes_read, io_stall_write_ms, num_of_writes, bytes_written, PhysicalName FROM #FileStats WHERE Pass = 2';
-        EXEC(@StringToExecute);
+            + ' (ServerName, CheckDate, DatabaseID, FileID, DatabaseName, FileLogicalName, TypeDesc, SizeOnDiskMB, io_stall_read_ms, num_of_reads, bytes_read, io_stall_write_ms, num_of_writes, bytes_written, PhysicalName) SELECT '
+            + ' @SrvName, @CheckDate, DatabaseID, FileID, DatabaseName, FileLogicalName, TypeDesc, SizeOnDiskMB, io_stall_read_ms, num_of_reads, bytes_read, io_stall_write_ms, num_of_writes, bytes_written, PhysicalName FROM #FileStats WHERE Pass = 2';
+
+		EXEC sp_executesql @StringToExecute,
+			N'@SrvName NVARCHAR(128), @CheckDate datetimeoffset',
+			@@SERVERNAME, @StartSampleTime;
     END;
     ELSE IF (SUBSTRING(@OutputTableNameFileStats, 2, 1) = '#')
     BEGIN
@@ -2854,8 +3167,9 @@ BEGIN
                 [cntr_type] INT NOT NULL,
                 [value_delta] BIGINT NULL,
                 [value_per_second] DECIMAL(18,2) NULL,
-                CONSTRAINT [PK_' + CAST(NEWID() AS CHAR(36)) + '] PRIMARY KEY CLUSTERED (ID ASC));';
-        EXEC(@StringToExecute);
+                PRIMARY KEY CLUSTERED (ID ASC));';
+
+		EXEC(@StringToExecute);
 
         /* Create the view */
         SET @ObjectFullName = @OutputDatabaseName + N'.' + @OutputSchemaName + N'.' +  @OutputTableNamePerfmonStats_View;
@@ -2866,18 +3180,171 @@ BEGIN
                 + '; EXEC (''CREATE VIEW '
                 + @OutputSchemaName + '.'
                 + @OutputTableNamePerfmonStats_View + ' AS ' + @LineFeed
-                + 'SELECT p.ServerName, p.CheckDate, p.object_name, p.counter_name, p.instance_name' + @LineFeed
-                + ', DATEDIFF(ss, pPrior.CheckDate, p.CheckDate) AS ElapsedSeconds' + @LineFeed
-                + ', p.cntr_value' + @LineFeed
-                + ', p.cntr_type' + @LineFeed
-                + ', (p.cntr_value - pPrior.cntr_value) AS cntr_delta' + @LineFeed
-                + ', (p.cntr_value - pPrior.cntr_value) * 1.0 / DATEDIFF(ss, pPrior.CheckDate, p.CheckDate) AS cntr_delta_per_second' + @LineFeed
-                + 'FROM ' + @OutputSchemaName + '.' + @OutputTableNamePerfmonStats + ' p' + @LineFeed
-                + 'INNER JOIN ' + @OutputSchemaName + '.' + @OutputTableNamePerfmonStats + ' pPrior ON p.ServerName = pPrior.ServerName AND p.object_name = pPrior.object_name AND p.counter_name = pPrior.counter_name AND p.instance_name = pPrior.instance_name AND p.CheckDate > pPrior.CheckDate' + @LineFeed
-                + 'LEFT OUTER JOIN ' + @OutputSchemaName + '.' + @OutputTableNamePerfmonStats + ' pMiddle ON p.ServerName = pMiddle.ServerName AND p.object_name = pMiddle.object_name AND p.counter_name = pMiddle.counter_name AND p.instance_name = pMiddle.instance_name AND p.CheckDate > pMiddle.CheckDate AND pMiddle.CheckDate > pPrior.CheckDate' + @LineFeed
-                + 'WHERE pMiddle.ID IS NULL AND DATEDIFF(MI, pPrior.CheckDate, p.CheckDate) BETWEEN 1 AND 60;'')';
-            EXEC(@StringToExecute);
+                + 'WITH RowDates as' + @LineFeed
+                + '(' + @LineFeed
+                + '        SELECT ' + @LineFeed
+                + '                ROW_NUMBER() OVER (ORDER BY [ServerName], [CheckDate]) ID,' + @LineFeed
+                + '                [CheckDate]' + @LineFeed
+                + '        FROM ' + @OutputSchemaName + '.' +@OutputTableNamePerfmonStats + '' + @LineFeed
+                + '        GROUP BY [ServerName], [CheckDate]' + @LineFeed
+                + '),' + @LineFeed
+                + 'CheckDates as' + @LineFeed
+                + '(' + @LineFeed
+                + '        SELECT ThisDate.CheckDate,' + @LineFeed
+                + '               LastDate.CheckDate as PreviousCheckDate' + @LineFeed
+                + '        FROM RowDates ThisDate' + @LineFeed
+                + '        JOIN RowDates LastDate' + @LineFeed
+                + '        ON ThisDate.ID = LastDate.ID + 1' + @LineFeed
+                + ')' + @LineFeed
+                + 'SELECT' + @LineFeed
+                + '       pMon.[ServerName]' + @LineFeed
+                + '      ,pMon.[CheckDate]' + @LineFeed
+                + '      ,pMon.[object_name]' + @LineFeed
+                + '      ,pMon.[counter_name]' + @LineFeed
+                + '      ,pMon.[instance_name]' + @LineFeed
+                + '      ,DATEDIFF(SECOND,pMonPrior.[CheckDate],pMon.[CheckDate]) AS ElapsedSeconds' + @LineFeed
+                + '      ,pMon.[cntr_value]' + @LineFeed
+                + '      ,pMon.[cntr_type]' + @LineFeed
+                + '      ,(pMon.[cntr_value] - pMonPrior.[cntr_value]) AS cntr_delta' + @LineFeed
+                + ' ,(pMon.cntr_value - pMonPrior.cntr_value) * 1.0 / DATEDIFF(ss, pMonPrior.CheckDate, pMon.CheckDate) AS cntr_delta_per_second' + @LineFeed
+                + '  FROM ' + @OutputSchemaName + '.' +@OutputTableNamePerfmonStats + ' pMon' + @LineFeed
+                + '  INNER HASH JOIN CheckDates Dates' + @LineFeed
+                + '  ON Dates.CheckDate = pMon.CheckDate' + @LineFeed
+                + '  JOIN ' + @OutputSchemaName + '.' +@OutputTableNamePerfmonStats + ' pMonPrior' + @LineFeed
+                + '  ON  Dates.PreviousCheckDate = pMonPrior.CheckDate' + @LineFeed
+                + '      AND pMon.[ServerName]    = pMonPrior.[ServerName]   ' + @LineFeed
+                + '      AND pMon.[object_name]   = pMonPrior.[object_name]  ' + @LineFeed
+                + '      AND pMon.[counter_name]  = pMonPrior.[counter_name] ' + @LineFeed
+                + '      AND pMon.[instance_name] = pMonPrior.[instance_name]' + @LineFeed
+                + '    WHERE DATEDIFF(MI, pMonPrior.CheckDate, pMon.CheckDate) BETWEEN 1 AND 60;'')'
+
+			EXEC(@StringToExecute);
+            END
+
+        /* Create the second view */
+        SET @ObjectFullName = @OutputDatabaseName + N'.' + @OutputSchemaName + N'.' +  @OutputTableNamePerfmonStatsActuals_View;
+        IF OBJECT_ID(@ObjectFullName) IS NULL
+            BEGIN
+            SET @StringToExecute = 'USE '
+                + @OutputDatabaseName
+                + '; EXEC (''CREATE VIEW '
+                + @OutputSchemaName + '.'
+                + @OutputTableNamePerfmonStatsActuals_View + ' AS ' + @LineFeed
+                + 'WITH PERF_AVERAGE_BULK AS' + @LineFeed
+                + '(' + @LineFeed
+                + '    SELECT ServerName,' + @LineFeed
+                + '           object_name,' + @LineFeed
+                + '           instance_name,' + @LineFeed
+                + '           counter_name,' + @LineFeed
+                + '           CASE WHEN CHARINDEX(''''('''', counter_name) = 0 THEN counter_name ELSE LEFT (counter_name, CHARINDEX(''''('''',counter_name)-1) END    AS   counter_join,' + @LineFeed
+                + '           CheckDate,' + @LineFeed
+                + '           cntr_delta' + @LineFeed
+                + '    FROM   ' + @OutputSchemaName + '.' + @OutputTableNamePerfmonStats_View + @LineFeed
+                + '    WHERE  cntr_type IN(1073874176)' + @LineFeed
+                + '    AND cntr_delta <> 0' + @LineFeed
+                + '),' + @LineFeed
+                + 'PERF_LARGE_RAW_BASE AS' + @LineFeed
+                + '(' + @LineFeed
+                + '    SELECT ServerName,' + @LineFeed
+                + '           object_name,' + @LineFeed
+                + '           instance_name,' + @LineFeed
+                + '           LEFT(counter_name, CHARINDEX(''''BASE'''', UPPER(counter_name))-1) AS counter_join,' + @LineFeed
+                + '           CheckDate,' + @LineFeed
+                + '           cntr_delta' + @LineFeed
+                + '    FROM   ' + @OutputSchemaName + '.' + @OutputTableNamePerfmonStats_View + '' + @LineFeed
+                + '    WHERE  cntr_type IN(1073939712)' + @LineFeed
+                + '    AND cntr_delta <> 0' + @LineFeed
+                + '),' + @LineFeed
+                + 'PERF_AVERAGE_FRACTION AS' + @LineFeed
+                + '(' + @LineFeed
+                + '    SELECT ServerName,' + @LineFeed
+                + '           object_name,' + @LineFeed
+                + '           instance_name,' + @LineFeed
+                + '           counter_name,' + @LineFeed
+                + '           counter_name AS counter_join,' + @LineFeed
+                + '           CheckDate,' + @LineFeed
+                + '           cntr_delta' + @LineFeed
+                + '    FROM   ' + @OutputSchemaName + '.' + @OutputTableNamePerfmonStats_View + '' + @LineFeed
+                + '    WHERE  cntr_type IN(537003264)' + @LineFeed
+                + '    AND cntr_delta <> 0' + @LineFeed
+                + '),' + @LineFeed
+                + 'PERF_COUNTER_BULK_COUNT AS' + @LineFeed
+                + '(' + @LineFeed
+                + '    SELECT ServerName,' + @LineFeed
+                + '           object_name,' + @LineFeed
+                + '           instance_name,' + @LineFeed
+                + '           counter_name,' + @LineFeed
+                + '           CheckDate,' + @LineFeed
+                + '           cntr_delta / ElapsedSeconds AS cntr_value' + @LineFeed
+                + '    FROM   ' + @OutputSchemaName + '.' + @OutputTableNamePerfmonStats_View + '' + @LineFeed
+                + '    WHERE  cntr_type IN(272696576, 272696320)' + @LineFeed
+                + '    AND cntr_delta <> 0' + @LineFeed
+                + '),' + @LineFeed
+                + 'PERF_COUNTER_RAWCOUNT AS' + @LineFeed
+                + '(' + @LineFeed
+                + '    SELECT ServerName,' + @LineFeed
+                + '           object_name,' + @LineFeed
+                + '           instance_name,' + @LineFeed
+                + '           counter_name,' + @LineFeed
+                + '           CheckDate,' + @LineFeed
+                + '           cntr_value' + @LineFeed
+                + '    FROM   ' + @OutputSchemaName + '.' + @OutputTableNamePerfmonStats_View + '' + @LineFeed
+                + '    WHERE  cntr_type IN(65792, 65536)' + @LineFeed
+                + ')' + @LineFeed
+                + '' + @LineFeed
+                + 'SELECT NUM.ServerName,' + @LineFeed
+                + '       NUM.object_name,' + @LineFeed
+                + '       NUM.counter_name,' + @LineFeed
+                + '       NUM.instance_name,' + @LineFeed
+                + '       NUM.CheckDate,' + @LineFeed
+                + '       NUM.cntr_delta / DEN.cntr_delta AS cntr_value' + @LineFeed
+                + '       ' + @LineFeed
+                + 'FROM   PERF_AVERAGE_BULK AS NUM' + @LineFeed
+                + '       JOIN PERF_LARGE_RAW_BASE AS DEN ON NUM.counter_join = DEN.counter_join' + @LineFeed
+                + '                                          AND NUM.CheckDate = DEN.CheckDate' + @LineFeed
+                + '                                          AND NUM.ServerName = DEN.ServerName' + @LineFeed
+                + '                                          AND NUM.object_name = DEN.object_name' + @LineFeed
+                + '                                          AND NUM.instance_name = DEN.instance_name' + @LineFeed
+                + '                                          AND DEN.cntr_delta <> 0' + @LineFeed
+                + '' + @LineFeed
+                + 'UNION ALL' + @LineFeed
+                + '' + @LineFeed
+                + 'SELECT NUM.ServerName,' + @LineFeed
+                + '       NUM.object_name,' + @LineFeed
+                + '       NUM.counter_name,' + @LineFeed
+                + '       NUM.instance_name,' + @LineFeed
+                + '       NUM.CheckDate,' + @LineFeed
+                + '       CAST((CAST(NUM.cntr_delta as DECIMAL(19)) / DEN.cntr_delta) as decimal(23,3))  AS cntr_value' +         @LineFeed
+                + 'FROM   PERF_AVERAGE_FRACTION AS NUM' + @LineFeed
+                + '       JOIN PERF_LARGE_RAW_BASE AS DEN ON NUM.counter_join = DEN.counter_join' + @LineFeed
+                + '                                          AND NUM.CheckDate = DEN.CheckDate' + @LineFeed
+                + '                                          AND NUM.ServerName = DEN.ServerName' + @LineFeed
+                + '                                          AND NUM.object_name = DEN.object_name' + @LineFeed
+                + '                                          AND NUM.instance_name = DEN.instance_name' + @LineFeed
+                + '                                          AND DEN.cntr_delta <> 0' + @LineFeed
+                + 'UNION ALL' + @LineFeed
+                + '' + @LineFeed
+                + 'SELECT ServerName,' + @LineFeed
+                + '       object_name,' + @LineFeed
+                + '       counter_name,' + @LineFeed
+                + '       instance_name,' + @LineFeed
+                + '       CheckDate,' + @LineFeed
+                + '       cntr_value' + @LineFeed
+                + 'FROM   PERF_COUNTER_BULK_COUNT' + @LineFeed
+                + '' + @LineFeed
+                + 'UNION ALL' + @LineFeed
+                + '' + @LineFeed
+                + 'SELECT ServerName,' + @LineFeed
+                + '       object_name,' + @LineFeed
+                + '       counter_name,' + @LineFeed
+                + '       instance_name,' + @LineFeed
+                + '       CheckDate,' + @LineFeed
+                + '       cntr_value' + @LineFeed
+                + 'FROM   PERF_COUNTER_RAWCOUNT;'')';
+
+			EXEC(@StringToExecute);
             END;
+
 
         SET @StringToExecute = N' IF EXISTS(SELECT * FROM '
             + @OutputDatabaseName
@@ -2886,11 +3353,12 @@ BEGIN
             + @OutputDatabaseName + '.'
             + @OutputSchemaName + '.'
             + @OutputTableNamePerfmonStats
-            + ' (ServerName, CheckDate, object_name, counter_name, instance_name, cntr_value, cntr_type, value_delta, value_per_second) SELECT '''
-            + CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128))
-            + ''', ''' + CONVERT(NVARCHAR(100), @StartSampleTime, 121) + ''', '
-            + 'object_name, counter_name, instance_name, cntr_value, cntr_type, value_delta, value_per_second FROM #PerfmonStats WHERE Pass = 2';
-        EXEC(@StringToExecute);
+            + ' (ServerName, CheckDate, object_name, counter_name, instance_name, cntr_value, cntr_type, value_delta, value_per_second) SELECT '
+            + ' @SrvName, @CheckDate, object_name, counter_name, instance_name, cntr_value, cntr_type, value_delta, value_per_second FROM #PerfmonStats WHERE Pass = 2';
+
+		EXEC sp_executesql @StringToExecute,
+			N'@SrvName NVARCHAR(128), @CheckDate datetimeoffset',
+			@@SERVERNAME, @StartSampleTime;
 
         /* Delete history older than @OutputTableRetentionDays */
         SET @StringToExecute = N' IF EXISTS(SELECT * FROM '
@@ -2900,10 +3368,11 @@ BEGIN
             + @OutputDatabaseName + '.'
             + @OutputSchemaName + '.'
             + @OutputTableNamePerfmonStats
-            + ' WHERE ServerName = '''
-            + CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128))
-            + ''' AND CheckDate < ''' + CAST(CAST( (DATEADD(DAY, -1 * @OutputTableRetentionDays, GETDATE() ) ) AS DATE) AS NVARCHAR(20)) + ''';';
-        EXEC(@StringToExecute);
+            + ' WHERE ServerName = @SrvName AND CheckDate < @CheckDate ;';
+
+		EXEC sp_executesql @StringToExecute,
+			N'@SrvName NVARCHAR(128), @CheckDate date',
+			@@SERVERNAME, @OutputTableCleanupDate;
 
 
 
@@ -2924,14 +3393,16 @@ BEGIN
                 [cntr_type] INT NOT NULL,
                 [value_delta] BIGINT NULL,
                 [value_per_second] DECIMAL(18,2) NULL,
-                CONSTRAINT [PK_' + CAST(NEWID() AS CHAR(36)) + '] PRIMARY KEY CLUSTERED (ID ASC));'
+                PRIMARY KEY CLUSTERED (ID ASC));'
             + ' INSERT '
             + @OutputTableNamePerfmonStats
-            + ' (ServerName, CheckDate, object_name, counter_name, instance_name, cntr_value, cntr_type, value_delta, value_per_second) SELECT '''
+            + ' (ServerName, CheckDate, object_name, counter_name, instance_name, cntr_value, cntr_type, value_delta, value_per_second) SELECT '
             + CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128))
-            + ''', ''' + CONVERT(NVARCHAR(100), @StartSampleTime, 121) + ''', '
-            + 'object_name, counter_name, instance_name, cntr_value, cntr_type, value_delta, value_per_second FROM #PerfmonStats WHERE Pass = 2';
-        EXEC(@StringToExecute);
+            + ' @SrvName, @CheckDate, object_name, counter_name, instance_name, cntr_value, cntr_type, value_delta, value_per_second FROM #PerfmonStats WHERE Pass = 2';
+
+		EXEC sp_executesql @StringToExecute,
+			N'@SrvName NVARCHAR(128), @CheckDate datetimeoffset',
+			@@SERVERNAME, @StartSampleTime;
     END;
     ELSE IF (SUBSTRING(@OutputTableNamePerfmonStats, 2, 1) = '#')
     BEGIN
@@ -2971,7 +3442,7 @@ BEGIN
                 wait_time_ms BIGINT,
                 signal_wait_time_ms BIGINT,
                 waiting_tasks_count BIGINT ,
-                CONSTRAINT [PK_' + CAST(NEWID() AS CHAR(36)) + '] PRIMARY KEY CLUSTERED (ID));' + @LineFeed
+                PRIMARY KEY CLUSTERED (ID));' + @LineFeed
 			+ 'CREATE NONCLUSTERED INDEX IX_ServerName_wait_type_CheckDate_Includes ON ' + @OutputSchemaName + '.' + @OutputTableNameWaitStats + @LineFeed
 			+ '(ServerName, wait_type, CheckDate) INCLUDE (wait_time_ms, signal_wait_time_ms, waiting_tasks_count);' + @LineFeed
 			+ 'END';
@@ -2987,7 +3458,8 @@ BEGIN
                 + '; EXEC (''CREATE TABLE '
                 + @OutputSchemaName + '.'
                 + @OutputTableNameWaitStats_Categories + ' (WaitType NVARCHAR(60) PRIMARY KEY CLUSTERED, WaitCategory NVARCHAR(128) NOT NULL, Ignorable BIT DEFAULT 0);'')';
-            EXEC(@StringToExecute);
+
+			EXEC(@StringToExecute);
             END;
 
 		/* Make sure the wait stats category table has the current number of rows */
@@ -2998,7 +3470,8 @@ BEGIN
 			+ 'TRUNCATE TABLE '  + @OutputSchemaName + '.' + @OutputTableNameWaitStats_Categories + @LineFeed
 			+ 'INSERT INTO ' + @OutputSchemaName + '.' + @OutputTableNameWaitStats_Categories + ' (WaitType, WaitCategory, Ignorable) SELECT WaitType, WaitCategory, Ignorable FROM ##WaitCategories;' + @LineFeed
 			+ 'END'')';
-        EXEC(@StringToExecute);
+
+		EXEC(@StringToExecute);
 
 
         /* Create the wait stats view */
@@ -3010,6 +3483,22 @@ BEGIN
                 + '; EXEC (''CREATE VIEW '
                 + @OutputSchemaName + '.'
                 + @OutputTableNameWaitStats_View + ' AS ' + @LineFeed
+                + 'WITH RowDates as' + @LineFeed
+                + '(' + @LineFeed
+                + '        SELECT ' + @LineFeed
+                + '                ROW_NUMBER() OVER (ORDER BY [ServerName], [CheckDate]) ID,' + @LineFeed
+                + '                [CheckDate]' + @LineFeed
+                + '        FROM ' + @OutputSchemaName + '.' + @OutputTableNameWaitStats + @LineFeed
+                + '        GROUP BY [ServerName], [CheckDate]' + @LineFeed
+                + '),' + @LineFeed
+                + 'CheckDates as' + @LineFeed
+                + '(' + @LineFeed
+                + '        SELECT ThisDate.CheckDate,' + @LineFeed
+                + '               LastDate.CheckDate as PreviousCheckDate' + @LineFeed
+                + '        FROM RowDates ThisDate' + @LineFeed
+                + '        JOIN RowDates LastDate' + @LineFeed
+                + '        ON ThisDate.ID = LastDate.ID + 1' + @LineFeed
+                + ')' + @LineFeed
                 + 'SELECT w.ServerName, w.CheckDate, w.wait_type, COALESCE(wc.WaitCategory, ''''Other'''') AS WaitCategory, COALESCE(wc.Ignorable,0) AS Ignorable' + @LineFeed
                 + ', DATEDIFF(ss, wPrior.CheckDate, w.CheckDate) AS ElapsedSeconds' + @LineFeed
                 + ', (w.wait_time_ms - wPrior.wait_time_ms) AS wait_time_ms_delta' + @LineFeed
@@ -3018,11 +3507,14 @@ BEGIN
                 + ', (w.signal_wait_time_ms - wPrior.signal_wait_time_ms) AS signal_wait_time_ms_delta' + @LineFeed
                 + ', (w.waiting_tasks_count - wPrior.waiting_tasks_count) AS waiting_tasks_count_delta' + @LineFeed
                 + 'FROM ' + @OutputSchemaName + '.' + @OutputTableNameWaitStats + ' w' + @LineFeed
-                + 'INNER JOIN ' + @OutputSchemaName + '.' + @OutputTableNameWaitStats + ' wPrior ON w.ServerName = wPrior.ServerName AND w.wait_type = wPrior.wait_type AND w.CheckDate > wPrior.CheckDate' + @LineFeed
-                + 'LEFT OUTER JOIN ' + @OutputSchemaName + '.' + @OutputTableNameWaitStats + ' wMiddle ON w.ServerName = wMiddle.ServerName AND w.wait_type = wMiddle.wait_type AND w.CheckDate > wMiddle.CheckDate AND wMiddle.CheckDate > wPrior.CheckDate' + @LineFeed
-				+ 'LEFT OUTER JOIN ' + @OutputSchemaName + '.' + @OutputTableNameWaitStats_Categories + ' wc ON w.wait_type = wc.WaitType' + @LineFeed
-                + 'WHERE wMiddle.ID IS NULL AND w.wait_time_ms >= wPrior.wait_time_ms AND DATEDIFF(MI, wPrior.CheckDate, w.CheckDate) BETWEEN 1 AND 60;'')';
-            EXEC(@StringToExecute);
+                + 'INNER HASH JOIN CheckDates Dates' + @LineFeed
+                + 'ON Dates.CheckDate = w.CheckDate' + @LineFeed
+                + 'INNER JOIN ' + @OutputSchemaName + '.' + @OutputTableNameWaitStats + ' wPrior ON w.ServerName = wPrior.ServerName AND w.wait_type = wPrior.wait_type AND Dates.PreviousCheckDate = wPrior.CheckDate' + @LineFeed
+			 + 'LEFT OUTER JOIN ' + @OutputSchemaName + '.' + @OutputTableNameWaitStats_Categories + ' wc ON w.wait_type = wc.WaitType' + @LineFeed
+                + 'WHERE DATEDIFF(MI, wPrior.CheckDate, w.CheckDate) BETWEEN 1 AND 60' + @LineFeed
+                + 'AND [w].[wait_time_ms] >= [wPrior].[wait_time_ms];'')'
+
+			EXEC(@StringToExecute);
             END;
 
 
@@ -3033,11 +3525,12 @@ BEGIN
             + @OutputDatabaseName + '.'
             + @OutputSchemaName + '.'
             + @OutputTableNameWaitStats
-            + ' (ServerName, CheckDate, wait_type, wait_time_ms, signal_wait_time_ms, waiting_tasks_count) SELECT '''
-            + CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128))
-            + ''', ''' + CONVERT(NVARCHAR(100), @StartSampleTime, 121) + ''', '
-            + 'wait_type, wait_time_ms, signal_wait_time_ms, waiting_tasks_count FROM #WaitStats WHERE Pass = 2 AND wait_time_ms > 0 AND waiting_tasks_count > 0';
-        EXEC(@StringToExecute);
+            + ' (ServerName, CheckDate, wait_type, wait_time_ms, signal_wait_time_ms, waiting_tasks_count) SELECT '
+            + ' @SrvName, @CheckDate, wait_type, wait_time_ms, signal_wait_time_ms, waiting_tasks_count FROM #WaitStats WHERE Pass = 2 AND wait_time_ms > 0 AND waiting_tasks_count > 0';
+
+		EXEC sp_executesql @StringToExecute,
+			N'@SrvName NVARCHAR(128), @CheckDate datetimeoffset',
+			@@SERVERNAME, @StartSampleTime;
 
         /* Delete history older than @OutputTableRetentionDays */
         SET @StringToExecute = N' IF EXISTS(SELECT * FROM '
@@ -3047,10 +3540,11 @@ BEGIN
             + @OutputDatabaseName + '.'
             + @OutputSchemaName + '.'
             + @OutputTableNameWaitStats
-            + ' WHERE ServerName = '''
-            + CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128))
-            + ''' AND CheckDate < ''' + CAST(CAST( (DATEADD(DAY, -1 * @OutputTableRetentionDays, GETDATE() ) ) AS DATE) AS NVARCHAR(20)) + ''';';
-        EXEC(@StringToExecute);
+            + ' WHERE ServerName = @SrvName AND CheckDate < @CheckDate ;';
+
+		EXEC sp_executesql @StringToExecute,
+			N'@SrvName NVARCHAR(128), @CheckDate date',
+			@@SERVERNAME, @OutputTableCleanupDate;
 
     END;
     ELSE IF (SUBSTRING(@OutputTableNameWaitStats, 2, 2) = '##')
@@ -3066,14 +3560,15 @@ BEGIN
                 wait_time_ms BIGINT,
                 signal_wait_time_ms BIGINT,
                 waiting_tasks_count BIGINT ,
-                CONSTRAINT [PK_' + CAST(NEWID() AS CHAR(36)) + '] PRIMARY KEY CLUSTERED (ID ASC));'
+                PRIMARY KEY CLUSTERED (ID ASC));'
             + ' INSERT '
             + @OutputTableNameWaitStats
-            + ' (ServerName, CheckDate, wait_type, wait_time_ms, signal_wait_time_ms, waiting_tasks_count) SELECT '''
-            + CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128))
-            + ''', ''' + CONVERT(NVARCHAR(100), @StartSampleTime, 121) + ''', '
-            + 'wait_type, wait_time_ms, signal_wait_time_ms, waiting_tasks_count FROM #WaitStats WHERE Pass = 2 AND wait_time_ms > 0 AND waiting_tasks_count > 0';
-        EXEC(@StringToExecute);
+            + ' (ServerName, CheckDate, wait_type, wait_time_ms, signal_wait_time_ms, waiting_tasks_count) SELECT '
+            + ' @SrvName, @CheckDate, wait_type, wait_time_ms, signal_wait_time_ms, waiting_tasks_count FROM #WaitStats WHERE Pass = 2 AND wait_time_ms > 0 AND waiting_tasks_count > 0';
+
+		EXEC sp_executesql @StringToExecute,
+			N'@SrvName NVARCHAR(128), @CheckDate datetimeoffset',
+			@@SERVERNAME, @StartSampleTime;
     END;
     ELSE IF (SUBSTRING(@OutputTableNameWaitStats, 2, 1) = '#')
     BEGIN
@@ -3173,7 +3668,7 @@ BEGIN
                     Finding,
                     Details;
         END;
-        ELSE IF @ExpertMode = 0 AND @OutputXMLasNVARCHAR = 0 AND @SinceStartup = 0
+        ELSE IF @ExpertMode = 0 AND @OutputType <> 'NONE' AND @OutputXMLasNVARCHAR = 0 AND @SinceStartup = 0
         BEGIN
             SELECT  [Priority] ,
                     [FindingsGroup] ,
@@ -3194,7 +3689,7 @@ BEGIN
                     Finding,
                     ID;
         END;
-        ELSE IF @ExpertMode = 0 AND @OutputXMLasNVARCHAR = 1 AND @SinceStartup = 0
+        ELSE IF @ExpertMode = 0 AND @OutputType <> 'NONE' AND @OutputXMLasNVARCHAR = 1 AND @SinceStartup = 0
         BEGIN
             SELECT  [Priority] ,
                     [FindingsGroup] ,
@@ -3331,7 +3826,7 @@ BEGIN
                     wd1.wait_type,
 					COALESCE(wcat.WaitCategory, 'Other') AS wait_category,
                     c.[Wait Time (Seconds)],
-                    CAST((wd2.wait_time_ms - wd1.wait_time_ms) / 1000.0 / cores.cpu_count / DATEDIFF(ss, wd1.SampleTime, wd2.SampleTime) AS DECIMAL(18,1)) AS [Per Core Per Second],
+                    CAST((CAST(wd2.wait_time_ms - wd1.wait_time_ms AS MONEY)) / 1000.0 / cores.cpu_count / DATEDIFF(ss, wd1.SampleTime, wd2.SampleTime) AS DECIMAL(18,1)) AS [Per Core Per Second],
                     c.[Signal Wait Time (Seconds)],
                     CASE WHEN c.[Wait Time (Seconds)] > 0
                      THEN CAST(100.*(c.[Signal Wait Time (Seconds)]/c.[Wait Time (Seconds)]) AS NUMERIC(4,1))
@@ -3480,7 +3975,7 @@ EXEC dbo.sp_BlitzFirst @ExpertMode = 1;
 
 Saving output to tables:
 EXEC sp_BlitzFirst
-, @OutputDatabaseName = 'DBAtools'
+  @OutputDatabaseName = 'DBAtools'
 , @OutputSchemaName = 'dbo'
 , @OutputTableName = 'BlitzFirst'
 , @OutputTableNameFileStats = 'BlitzFirst_FileStats'
